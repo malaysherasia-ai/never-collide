@@ -26,10 +26,14 @@ git clone --depth 1 https://github.com/malaysherasia-ai/never-collide.git
 & "C:\Program Files\Git\bin\bash.exe" never-collide/install.sh .
 ```
 
-The installer copies the `ncl` CLI into `.claude/never-collide/`, adds
-starter `AGENTS.md`, `.agents/OWNERSHIP.md` and `.agents/PROTOCOL.md` only when
-they do not exist, adds a marked block to `CLAUDE.md` without replacing it,
-and ignores local state. Safe to re-run.
+The installer copies the `ncl` CLI into `.claude/never-collide/`, the hook
+dispatcher and git runner into `.claude/hooks/ncl/`, and the skill into
+`.claude/skills/never-collide/`. It adds starter `AGENTS.md`,
+`.agents/OWNERSHIP.md` and `.agents/PROTOCOL.md` only when they do not exist,
+adds a marked block to `CLAUDE.md` without replacing it, ignores local state,
+registers the edit hook in `.claude/settings.json` (merged, never replaced)
+and installs the git pre-commit stub. Safe to re-run; that is also how you
+upgrade.
 
 Then give each tool its own identity. Claude Code reads
 `.claude/settings.json`; the others take an environment variable:
@@ -91,12 +95,41 @@ share a directory are treated as overlapping.
 
 Timestamps are UTC in the ledger; `ncl status` prints local time.
 
-## Version 0.1.0
+## Enforcement, because agents forget
 
-This release is the ledger CLI, the protocol templates and the installer.
-Nothing yet stops an agent that skips `ncl`; the protocol in `AGENTS.md`
-and PR review do. Edit-time hooks, a commit hook and a PR check are the next
-releases. See [CHANGELOG.md](CHANGELOG.md).
+Two hooks check the same thing: is every path this agent is about to touch
+covered by an active claim it holds?
+
+- **Edit hook (Claude Code).** Registered by the installer in
+  `.claude/settings.json` on `Edit|Write|MultiEdit|NotebookEdit`. An
+  unclaimed path, or one held by another agent, is asked about with the
+  reason and the holder's name. Other tools can point their own pre-tool hook
+  at `.claude/hooks/ncl/dispatch --agent codex|gemini|copilot|antigravity`;
+  the dispatcher reads each tool's payload shape and answers in its dialect.
+  Only the Claude Code entry is installed and tested so far.
+- **Commit hook (git).** A stub in `.git/hooks/pre-commit` runs the same check
+  over the staged files, from any tool or terminal. A commit on `main` is
+  flagged too. If never-again is installed, the two share the stub.
+
+Every hook starts in **warn** mode: it asks, it does not stop. When the team
+has run a week without false positives, promote it:
+
+```sh
+ncl enforce deny     # unclaimed edits and commits are refused
+ncl enforce warn     # back to asking
+ncl enforce off      # silent
+```
+
+The mode lives in `.agents/never-collide.json`, so it is committed and the
+same for every agent. `exempt` there lists paths anyone may touch without a
+claim. `ncl check <path>` answers the question by hand.
+
+Hooks read a local ledger cache (`.ncl/`, ignored) refreshed at most every two
+minutes, so an edit does not wait on the network; a claim refreshes it at
+once. Offline, the last cache is used and the answer says so.
+
+Not yet: a pull-request check. Until then a PR review is the last line.
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Requirements
 

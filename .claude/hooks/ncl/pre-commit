@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# never-collide git runner. Installed as .claude/hooks/ncl/pre-commit and
+# called from the stub in .git/hooks/pre-commit, so the claim check applies to
+# every commit: from Claude Code, from any other tool, and from a person at a
+# shell. Every staged file must be covered by an active claim held by the
+# committing agent (AGENT_NAME). Warn mode prints and lets the commit through;
+# deny mode refuses it. Commits on main are warned about the same way.
+set -uo pipefail
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) command -v cygpath >/dev/null 2>&1 && ROOT="$(cygpath -m "$ROOT")" ;;
+esac
+[ -f "$ROOT/.claude/hooks/ncl/dispatch" ] || exit 0
+export CLAUDE_PROJECT_DIR="$ROOT" NCL_EVENT=git
+exec bash "$ROOT/.claude/hooks/ncl/dispatch" </dev/null

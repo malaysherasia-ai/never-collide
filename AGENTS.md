@@ -18,9 +18,10 @@ This repository dogfoods never-collide. `ncl` below means
    `ncl tested --task <id> --evidence '<what you ran>'`.
 7. **Release.** After merge, `ncl release --task <id>`.
 
-Version 0.1.0 is a manual protocol: nothing yet stops an agent that skips
-`ncl`. Do not claim otherwise in docs or commit messages. Never commit
-directly to `main`.
+The edit hook and the git pre-commit hook check every path against the
+ledger and run in warn mode here. When one asks, the answer is to claim or
+to hand off, never to proceed. There is no pull-request check yet; do not
+claim otherwise in docs or commit messages. Never commit directly to `main`.
 
 ## Definition of done
 
