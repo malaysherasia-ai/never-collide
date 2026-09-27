@@ -626,6 +626,40 @@ class UpgradeTests(RepoFixture):
         self.assertEqual(run([sys.executable, str(installed), "version"], self.repo, env).stdout.strip(),
                          "ncl 9.9.9")
 
+    def test_upgrade_falls_back_to_the_releases_list_for_prereleases(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.endswith("/releases/latest"):
+                    body, status = b'{"message": "Not Found"}', 404
+                else:
+                    body, status = json.dumps([
+                        {"tag_name": "v9.9.9", "draft": False, "prerelease": True},
+                        {"tag_name": "v9.9.8", "draft": False, "prerelease": True}]).encode(), 200
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            env = os.environ.copy()
+            env["NCL_UPDATE_URL"] = "http://127.0.0.1:{}/repos/x/y/releases/latest".format(
+                server.server_port)
+            result = run([sys.executable, str(SCRIPT), "upgrade", "--check"], self.repo, env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("available  9.9.9 (release v9.9.9)", result.stdout)
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_upgrade_without_network_explains(self):
         env = os.environ.copy()
         env["NCL_UPDATE_URL"] = "http://127.0.0.1:9/releases"
