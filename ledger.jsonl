@@ -1,3 +1,4 @@
 {"agent":"claude","branch":"main","id":"NCL-1","intent":"Build never-collide 0.1.0 through 0.4.0: CLI fixes, hooks, PR check, docs, feedback","paths":["**"],"status":"claimed","task":"NCL-1","tool":"claude-code","ts":"2026-09-27T05:39:06Z","ttl_h":8.0}
 {"agent":"claude","branch":"main","id":"NCL-1","paths":["**"],"status":"in_progress","task":"NCL-1","tool":"claude-code","ts":"2026-09-27T05:39:07Z","ttl_h":8.0}
 {"agent":"claude","branch":"main","id":"NCL-1","message":"Rewrote ncl for 0.1.0: handoff requests, ncl log, intent carried forward","paths":["**"],"status":"in_progress","task":"NCL-1","tool":"claude","ts":"2026-09-27T05:41:49Z","ttl_h":8.0}
+{"agent":"claude","branch":"claude/v0.2.0","id":"NCL-1","message":"0.1.0 tagged. Starting 0.2.0 on claude/v0.2.0: ncl check, Claude Code PreToolUse hook, git pre-commit hook, skill, installer wiring","paths":["**"],"status":"in_progress","task":"NCL-1","tool":"claude","ts":"2026-09-27T05:51:07Z","ttl_h":8.0}
