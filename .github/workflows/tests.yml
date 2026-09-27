@@ -2,15 +2,24 @@ name: tests
 
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
 
 jobs:
   python-tests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.7', '3.11', '3.13']
+        include:
+          # Ubuntu 24.04 runners carry no Python 3.7 build; 22.04 still does.
+          - python-version: '3.7'
+            os: ubuntu-22.04
+          - python-version: '3.11'
+            os: ubuntu-latest
+          - python-version: '3.13'
+            os: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
