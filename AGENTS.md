@@ -3,9 +3,10 @@
 This repository dogfoods never-collide. `ncl` below means
 `python .claude/never-collide/ncl`. Before editing anything here:
 
-1. **Identity.** Set `AGENT_NAME` to your tool identity (`claude`,
-   `antigravity`, `codex`, `gemini`, `copilot`) and run `ncl whoami`. If it
-   fails, stop.
+1. **Identity.** Run `ncl whoami`. It answers from `AGENT_NAME` or from
+   this clone's `.ncl/agent`. If it fails, stop and ask the user to run
+   `ncl whoami --set <tool>` (`claude`, `antigravity`, `codex`, `gemini`,
+   `copilot`) once in this clone; never guess an identity.
 2. **Sync.** Run `ncl status` and read who holds what.
 3. **Claim.** `ncl claim --task <id> --paths <globs> --intent '<one line>'`
    for the paths you will change. If the claim is refused, run

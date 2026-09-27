@@ -3,7 +3,8 @@
 #
 # One entry in the agent's hook config points here. Claude Code's
 # settings.json calls it before Edit, Write, MultiEdit and NotebookEdit with
-# the tool payload on stdin; the git pre-commit runner calls it with
+# the tool payload on stdin; the other tools reach it through
+# ~/.never-collide/launch; the git pre-commit runner calls it with
 # NCL_EVENT=git and no stdin. It finds an interpreter and the repo, then hands
 # the payload to `ncl check --hook`, which decides: allow when every path the
 # call touches is covered by an active claim held by this agent; otherwise
@@ -12,7 +13,9 @@
 #
 #   dispatch [--agent claude|codex|gemini|copilot|antigravity]
 #
-# The agent name selects the output dialect. It defaults to claude.
+# The agent name selects the output dialect and, when AGENT_NAME is not in
+# the environment, the identity. It defaults to claude. Always exits 0 as a
+# hook: some tools treat a non-zero exit as "deny everything".
 set -uo pipefail
 
 NCL_AGENT="${NCL_AGENT:-}"
@@ -23,6 +26,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+[ -n "$NCL_AGENT" ] && export AGENT_NAME="${AGENT_NAME:-$NCL_AGENT}"
 
 PAYLOAD=""
 [ "${NCL_EVENT:-}" = "git" ] || PAYLOAD="$(cat)"
@@ -52,16 +56,20 @@ native_path() {
 if ! PY="$(ncl_python)"; then
   if [ "${NCL_EVENT:-}" = "git" ]; then
     echo "never-collide: no working python found; no check ran. Install Python 3.7+ or set NCL_PYTHON." >&2
-  else
+  elif [ -z "$NCL_AGENT" ] || [ "$NCL_AGENT" = "claude" ]; then
     printf '{"systemMessage":"never-collide: no working python found; no check ran. Install Python 3.7+ or set NCL_PYTHON."}\n'
   fi
   exit 0
 fi
 
-# The repo: CLAUDE_PROJECT_DIR from Claude Code, else the payload's working
-# directory ("cwd" at the top for most agents, "Cwd" in the arguments for
-# Antigravity), else where we are.
+# The repo, in order: CLAUDE_PROJECT_DIR from Claude Code; where this script
+# lives (.claude/hooks/ncl/dispatch is three levels below the root); the
+# payload's working directory; where we are.
 ROOT="${CLAUDE_PROJECT_DIR:-}"
+if [ -z "$ROOT" ]; then
+  SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." 2>/dev/null && pwd)"
+  [ -n "$SELF" ] && [ -f "$SELF/.claude/never-collide/ncl" ] && ROOT="$SELF"
+fi
 if [ -z "$ROOT" ] && [ -n "$PAYLOAD" ]; then
   CWD="$(printf '%s' "$PAYLOAD" | sed -n 's/.*"[cC]wd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   CWD="${CWD//\\\\//}"
@@ -76,4 +84,5 @@ export PYTHONIOENCODING=utf-8 PYTHONUTF8=1
 if [ "${NCL_EVENT:-}" = "git" ]; then
   exec "$PY" "$CLI" check --hook git --staged
 fi
-printf '%s' "$PAYLOAD" | exec "$PY" "$CLI" check --hook "${NCL_AGENT:-claude}" --payload
+printf '%s' "$PAYLOAD" | "$PY" "$CLI" check --hook "${NCL_AGENT:-claude}" --payload
+exit 0

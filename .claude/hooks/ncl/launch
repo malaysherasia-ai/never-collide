@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# never-collide launcher. `ncl install-hooks --agent ...` copies this to
+# ~/.never-collide/launch, and the hook entries of Antigravity, Codex, Gemini
+# CLI and Copilot point there:
+#
+#   bash -c "test -f ~/.never-collide/launch && exec bash ~/.never-collide/launch --agent antigravity; exit 0"
+#
+# The entry holds no path of this machine, no quote and no substitution, so
+# the same committed config works on every machine, and a clone whose owner
+# has not installed never-collide exits 0 from the entry itself. This file
+# finds the repo from the payload's own working directory and hands the
+# payload to that repo's dispatcher.
+#
+#   launch --agent NAME
+set -u
+AGENT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent) AGENT="${2:-}"; shift ;;
+    --agent=*) AGENT="${1#--agent=}" ;;
+  esac
+  shift
+done
+
+PAYLOAD="$(cat)"
+
+# The working directory without an interpreter: "cwd" at the top for Codex,
+# Gemini and Copilot; "Cwd" inside the arguments for Antigravity's commands;
+# the first of "workspacePaths" for Antigravity's file edits.
+CWD="$(printf '%s' "$PAYLOAD" | sed -n 's/.*"[cC]wd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+if [ -z "$CWD" ]; then
+  CWD="$(printf '%s' "$PAYLOAD" | sed -n 's/.*"workspacePaths"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+fi
+CWD="${CWD//\\\\//}"
+[ -n "$CWD" ] && [ -d "$CWD" ] || CWD="$PWD"
+
+ROOT="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)" || ROOT=""
+[ -n "$ROOT" ] || exit 0                                     # not in a repo
+[ -f "$ROOT/.claude/hooks/ncl/dispatch" ] || exit 0          # not installed here
+
+printf '%s' "$PAYLOAD" | exec bash "$ROOT/.claude/hooks/ncl/dispatch" --agent "$AGENT"

@@ -13,8 +13,9 @@ so the tool halfway through that page is not surprised by your rewrite.
 
 ## The ritual
 
-1. **Identity.** `ncl whoami`. If `AGENT_NAME` is unset, stop and tell the
-   user; never guess an identity.
+1. **Identity.** `ncl whoami`. It answers from `AGENT_NAME` or from this
+   clone's `.ncl/agent`. If it fails, stop and ask the user to run
+   `ncl whoami --set <tool>` once in this clone; never guess an identity.
 2. **Sync.** `ncl status`. Read every active claim and every message
    addressed to you before planning an edit.
 3. **Claim.** `ncl claim --task <id> --paths <globs> --intent '<one line>'`.
