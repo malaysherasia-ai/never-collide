@@ -140,6 +140,42 @@ Real merge conflicts surface at PR time, where a person sees them.
 
 See [CHANGELOG.md](CHANGELOG.md) for what each version added.
 
+## Numbers, and an optional hello
+
+Usage is counted from GitHub clone statistics. `ncl` sends nothing home on
+its own: the network calls it makes are ledger pushes to your `origin` and,
+only when you run it, `ncl upgrade` against GitHub's release API.
+
+The installer asks once per machine, and Enter skips it:
+
+```
+never-collide is free and sends nothing home on its own. Help us count you?
+  [Enter] skip   [c] count me, anonymously   [f] count me and leave feedback
+```
+
+`c` sends the version, OS and Python version. `f` asks for a name, an email,
+which tools you run and what you think, every field optional, then shows the
+exact payload and sends it only on a yes. Later, or instead:
+
+```sh
+ncl feedback                      # same questions
+ncl feedback --count --yes        # just count me
+ncl feedback -m 'wish it did X'   # shows the payload, asks before sending
+ncl feedback --dry-run -m '...'   # shows the payload, sends nothing
+```
+
+`NCL_NO_PROMPT=1` means never ask; CI is never asked. What the endpoint
+receives and stores is in [docs/feedback-endpoint.md](docs/feedback-endpoint.md).
+
+## Upgrade
+
+```sh
+ncl upgrade --check     # only look
+ncl upgrade             # fetch the newest release and run its installer here
+```
+
+Or re-run `install.sh` from a fresh clone; it is the same thing.
+
 ## Requirements
 
 - Python 3.7+ and git

@@ -490,5 +490,147 @@ class VerifyPrTests(RepoFixture):
         self.verify(expect=0)
 
 
+class FeedbackTests(RepoFixture):
+    """A local HTTP server stands in for the site endpoint."""
+
+    def setUp(self):
+        super().setUp()
+        import http.server
+        import threading
+        received = self.received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                received.append((self.path, self.headers.get("User-Agent", ""),
+                                 json.loads(self.rfile.read(length).decode("utf-8"))))
+                body = b'{"ok": true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = "http://127.0.0.1:{}/api/never-collide/feedback".format(self.server.server_port)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        super().tearDown()
+
+    def feedback(self, *args, expect=0, stdin=None, tty_home=None):
+        env = os.environ.copy()
+        env["NCL_FEEDBACK_URL"] = self.url
+        env["NCL_HOME"] = tty_home or str(self.root / "home")
+        env.pop("NCL_NO_PROMPT", None)
+        result = run([sys.executable, str(SCRIPT), "feedback"] + list(args), self.repo, env, stdin)
+        self.assertEqual(result.returncode, expect, result.stdout + result.stderr)
+        return result
+
+    def test_dry_run_sends_nothing_and_shows_payload(self):
+        result = self.feedback("--dry-run", "--message", "works well", "--name", "Sam")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["event"], "feedback")
+        self.assertEqual(payload["message"], "works well")
+        self.assertEqual(payload["name"], "Sam")
+        self.assertNotIn("email", payload)
+        self.assertEqual(self.received, [])
+
+    def test_count_and_feedback_are_posted_only_with_yes(self):
+        declined = self.feedback("--count", stdin="n\n")
+        self.assertIn("Nothing sent", declined.stdout)
+        self.assertEqual(self.received, [])
+
+        sent = self.feedback("--count", "--yes")
+        self.assertIn("Sent (200", sent.stdout)
+        path, agent, payload = self.received[-1]
+        self.assertEqual(path, "/api/never-collide/feedback")
+        self.assertTrue(agent.startswith("never-collide/"))
+        self.assertEqual(payload["event"], "count")
+        self.assertEqual(set(payload), {"project", "event", "version", "os", "python", "ts"})
+
+        self.feedback("--yes", "--email", "sam@example.invalid", "-m", "add a tui")
+        self.assertEqual(self.received[-1][2]["email"], "sam@example.invalid")
+        self.assertEqual(self.received[-1][2]["message"], "add a tui")
+
+    def test_nothing_to_send_without_a_tty_fails_cleanly(self):
+        result = self.feedback(expect=1, stdin="")
+        self.assertIn("nothing to send", result.stderr)
+
+    def test_install_prompt_is_silent_without_a_tty(self):
+        result = self.feedback("--install-prompt", stdin="")
+        self.assertEqual(result.stdout, "")
+        self.assertFalse((self.root / "home" / "prompted").exists())
+        self.assertEqual(self.received, [])
+
+    def test_unreachable_endpoint_is_reported(self):
+        env = os.environ.copy()
+        env["NCL_FEEDBACK_URL"] = "http://127.0.0.1:9/nowhere"
+        result = run([sys.executable, str(SCRIPT), "feedback", "--count", "--yes"], self.repo, env)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("could not send feedback", result.stderr)
+
+
+class UpgradeTests(RepoFixture):
+    def stage_source(self, version):
+        import shutil
+        source = self.root / ("source-" + version)
+        for relative in ("install.sh", "VERSION", ".claude/never-collide/ncl",
+                         ".claude/never-collide/ncl.cmd", ".claude/hooks/ncl/dispatch",
+                         ".claude/hooks/ncl/pre-commit", ".claude/skills/never-collide/SKILL.md",
+                         "templates/AGENTS.md", "templates/OWNERSHIP.md", "templates/PROTOCOL.md",
+                         "templates/never-collide.yml"):
+            target = source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / relative, target)
+        (source / "VERSION").write_text(version + "\n", encoding="utf-8")
+        cli = source / ".claude" / "never-collide" / "ncl"
+        cli.write_text(cli.read_text(encoding="utf-8").replace(
+            'VERSION = "{}"'.format(ncl.VERSION), 'VERSION = "{}"'.format(version)), encoding="utf-8")
+        return source
+
+    def test_upgrade_from_a_local_source(self):
+        env = os.environ.copy()
+        env["NCL_NO_PROMPT"] = "1"
+        install = run(["bash", str(ROOT / "install.sh"), str(self.repo)], ROOT, env)
+        self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+        installed = self.repo / ".claude" / "never-collide" / "ncl"
+
+        same = run([sys.executable, str(installed), "upgrade", "--from", str(ROOT)], self.repo, env)
+        self.assertEqual(same.returncode, 0, same.stderr)
+        self.assertIn("up to date", same.stdout)
+
+        newer = self.stage_source("9.9.9")
+        check = run([sys.executable, str(installed), "upgrade", "--check", "--from", str(newer)],
+                    self.repo, env)
+        self.assertIn("available  9.9.9", check.stdout)
+        self.assertIn("Run ncl upgrade", check.stdout)
+        self.assertEqual(run([sys.executable, str(installed), "version"], self.repo, env).stdout.strip(),
+                         "ncl " + ncl.VERSION)
+
+        declined = run([sys.executable, str(installed), "upgrade", "--from", str(newer)],
+                       self.repo, env, stdin="n\n")
+        self.assertEqual(declined.returncode, 1)
+
+        done = run([sys.executable, str(installed), "upgrade", "--yes", "--from", str(newer)],
+                   self.repo, env)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(run([sys.executable, str(installed), "version"], self.repo, env).stdout.strip(),
+                         "ncl 9.9.9")
+
+    def test_upgrade_without_network_explains(self):
+        env = os.environ.copy()
+        env["NCL_UPDATE_URL"] = "http://127.0.0.1:9/releases"
+        result = run([sys.executable, str(SCRIPT), "upgrade", "--check"], self.repo, env)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("could not reach GitHub", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
