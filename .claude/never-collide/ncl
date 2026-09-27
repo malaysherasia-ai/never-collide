@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""ncl: coordinate coding agents that share one Git repository.
+
+Every agent calls dibs on the paths it is about to touch. Claims live in an
+append-only ledger.jsonl on the orphan branch agents/ledger. Git's
+fast-forward push is the lock: when two agents write at once, the second push
+is rejected, the ledger is re-read, and the overlap check runs again.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+
+VERSION = "0.1.0"
+LEDGER_FILE = "ledger.jsonl"
+LEDGER_REF = "refs/remotes/origin/agents/ledger"
+LEDGER_BRANCH = "refs/heads/agents/ledger"
+ACTIVE_STATUSES = ("claimed", "in_progress", "done", "tested")
+DEFAULT_TTL_HOURS = 4.0
+RETRY_LIMIT = 4
+RECENT_HOURS = 24
+
+
+class NclError(Exception):
+    """An expected command or coordination failure."""
+
+
+# --- git plumbing -----------------------------------------------------------
+
+def git(args: Sequence[str], input_text: Optional[str] = None,
+        check: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        ["git"] + list(args),
+        input=input_text.encode("utf-8") if input_text is not None else None,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    result.stdout = result.stdout.decode("utf-8", errors="replace")
+    result.stderr = result.stderr.decode("utf-8", errors="replace")
+    if check and result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise NclError(detail or "git command failed")
+    return result
+
+
+def require_origin() -> None:
+    if git(["remote", "get-url", "origin"], check=False).returncode:
+        raise NclError("this repository needs a Git remote named origin")
+
+
+def current_branch() -> str:
+    return git(["branch", "--show-current"], check=False).stdout.strip()
+
+
+# --- identity and time ------------------------------------------------------
+
+def agent_name(required: bool = True) -> str:
+    value = os.environ.get("AGENT_NAME", "").strip()
+    if not value and required:
+        raise NclError("AGENT_NAME is unset; each tool needs its own identity "
+                       "(for example AGENT_NAME=claude or AGENT_NAME=antigravity)")
+    return value or "unknown"
+
+
+def tool_name() -> str:
+    return os.environ.get("AGENT_TOOL", "").strip() or agent_name()
+
+
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+
+def iso(moment: dt.datetime) -> str:
+    return moment.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_timestamp(value: str) -> dt.datetime:
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def local_time(value: str) -> str:
+    return parse_timestamp(value).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def local_clock(moment: dt.datetime) -> str:
+    return moment.astimezone().strftime("%H:%M")
+
+
+def local_zone() -> str:
+    return dt.datetime.now().astimezone().strftime("UTC%z")
+
+
+# --- path patterns ----------------------------------------------------------
+
+def normalise(path: str) -> str:
+    return path.replace("\\", "/").strip().strip("/")
+
+
+def glob_prefix(pattern: str) -> str:
+    """Literal directory prefix before the first wildcard, or "" for none."""
+    positions = [position for position in (pattern.find("*"), pattern.find("?"),
+                                           pattern.find("[")) if position >= 0]
+    if not positions:
+        return pattern.rstrip("/")
+    prefix = pattern[:min(positions)]
+    if "/" in prefix:
+        return prefix[:prefix.rfind("/") + 1].rstrip("/")
+    return ""
+
+
+def patterns_overlap(left: str, right: str) -> bool:
+    """Conservative overlap check between two claim patterns.
+
+    Two patterns overlap unless their literal prefixes name disjoint
+    directories. Anything wildcarded at the root overlaps everything.
+    """
+    left, right = normalise(left), normalise(right)
+    if left == right:
+        return True
+    left_prefix, right_prefix = glob_prefix(left), glob_prefix(right)
+    if not left_prefix or not right_prefix:
+        return True
+    return (left_prefix == right_prefix
+            or left_prefix.startswith(right_prefix + "/")
+            or right_prefix.startswith(left_prefix + "/"))
+
+
+def paths_overlap(left_paths: Sequence[str], right_paths: Sequence[str]) -> bool:
+    return any(patterns_overlap(left, right)
+               for left in left_paths for right in right_paths)
+
+
+# --- ledger model -----------------------------------------------------------
+
+def parse_ledger(lines: Sequence[str]) -> List[Dict[str, Any]]:
+    records = []
+    for number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except ValueError as error:
+            raise NclError("ledger line {} is not valid JSON: {}".format(number, error))
+    return records
+
+
+def is_message(record: Dict[str, Any]) -> bool:
+    return record.get("kind") == "message"
+
+
+def latest_states(records: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Newest state record per task. Messages never change a task's state."""
+    latest: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        if not is_message(record):
+            latest[record["task"]] = record
+    return latest
+
+
+def expires_at(record: Dict[str, Any]) -> dt.datetime:
+    hours = float(record.get("ttl_h", DEFAULT_TTL_HOURS))
+    return parse_timestamp(record["ts"]) + dt.timedelta(hours=hours)
+
+
+def is_active(record: Dict[str, Any], now: Optional[dt.datetime] = None) -> bool:
+    if record.get("status") not in ACTIVE_STATUSES:
+        return False
+    return expires_at(record) > (now or now_utc())
+
+
+def is_expired(record: Dict[str, Any], now: Optional[dt.datetime] = None) -> bool:
+    return record.get("status") in ACTIVE_STATUSES and not is_active(record, now)
+
+
+def is_recent(record: Dict[str, Any], now: Optional[dt.datetime] = None) -> bool:
+    age = (now or now_utc()) - parse_timestamp(record["ts"])
+    return age <= dt.timedelta(hours=RECENT_HOURS)
+
+
+# --- ledger storage ---------------------------------------------------------
+
+def fetch_ledger() -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Fetch origin/agents/ledger. Returns (commit, records); (None, []) if absent."""
+    git(["fetch", "--quiet", "origin", "+refs/heads/agents/ledger:" + LEDGER_REF],
+        check=False)
+    ref = git(["rev-parse", "--verify", "--quiet", LEDGER_REF], check=False)
+    if ref.returncode:
+        return None, []
+    commit = ref.stdout.strip()
+    content = git(["show", "{}:{}".format(LEDGER_REF, LEDGER_FILE)])
+    return commit, parse_ledger(content.stdout.splitlines())
+
+
+def conflicts_for(record: Dict[str, Any], states: Dict[str, Dict[str, Any]],
+                  now: dt.datetime) -> List[Dict[str, Any]]:
+    return [current for current in states.values()
+            if current.get("agent") != record["agent"]
+            and current.get("task") != record["task"]
+            and is_active(current, now)
+            and paths_overlap(record.get("paths", []), current.get("paths", []))]
+
+
+def append_ledger(record: Dict[str, Any], validate_claim: bool = False) -> None:
+    """Append one record to the ledger with fetch, check, commit, push, retry."""
+    require_origin()
+    for attempt in range(1, RETRY_LIMIT + 1):
+        parent, records = fetch_ledger()
+        if validate_claim:
+            conflicts = conflicts_for(record, latest_states(records), now_utc())
+            if conflicts:
+                details = "; ".join(
+                    "{} held by {} on {}".format(item["task"], item["agent"],
+                                                 ", ".join(item.get("paths", [])))
+                    for item in conflicts)
+                raise NclError("claim refused, paths overlap active work: " + details
+                               + ". Use ncl handoff to ask for them, then stop.")
+        payload = "".join(json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n"
+                          for item in records)
+        payload += json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        blob = git(["hash-object", "-w", "--stdin"], input_text=payload).stdout.strip()
+        tree = git(["mktree"], input_text="100644 blob {}\t{}\n".format(
+            blob, LEDGER_FILE)).stdout.strip()
+        commit_args = ["commit-tree", tree]
+        if parent:
+            commit_args.extend(["-p", parent])
+        commit_args.extend(["-m", "ncl: {} {} {}".format(
+            record["agent"], record["status"], record["task"])])
+        commit = git(commit_args).stdout.strip()
+        pushed = git(["push", "--quiet", "origin", commit + ":" + LEDGER_BRANCH],
+                     check=False)
+        if pushed.returncode == 0:
+            return
+        if attempt == RETRY_LIMIT:
+            raise NclError("could not update ledger after {} attempts: {}".format(
+                RETRY_LIMIT, pushed.stderr.strip() or "push rejected"))
+
+
+# --- records ----------------------------------------------------------------
+
+def base_record(task: str, status: str,
+                previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    previous = previous or {}
+    record: Dict[str, Any] = {
+        "id": task,
+        "task": task,
+        "agent": agent_name(),
+        "tool": tool_name(),
+        "status": status,
+        "paths": list(previous.get("paths", [])),
+        "ts": iso(now_utc()),
+        "ttl_h": float(previous.get("ttl_h", DEFAULT_TTL_HOURS)),
+    }
+    for key in ("intent", "pr", "preview"):
+        if previous.get(key):
+            record[key] = previous[key]
+    branch = current_branch()
+    if branch:
+        record["branch"] = branch
+    return record
+
+
+def held_task(task: str, records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    record = latest_states(records).get(task)
+    if not record or not is_active(record):
+        raise NclError("no active claim for task {}; run ncl claim first".format(task))
+    if record.get("agent") != agent_name():
+        raise NclError("task {} is held by {}, not {}".format(
+            task, record.get("agent", "unknown"), agent_name()))
+    return record
+
+
+def load_held(task: str) -> Dict[str, Any]:
+    require_origin()
+    _, records = fetch_ledger()
+    return held_task(task, records)
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_whoami(_: argparse.Namespace) -> int:
+    print(agent_name())
+    return 0
+
+
+def cmd_claim(args: argparse.Namespace) -> int:
+    record = base_record(args.task, "claimed")
+    record["paths"] = [normalise(path) for path in args.paths]
+    record["intent"] = args.intent
+    record["ttl_h"] = float(args.ttl)
+    append_ledger(record, validate_claim=True)
+    print("Claimed {} for {} ({:g}h TTL).".format(
+        args.task, ", ".join(record["paths"]), args.ttl))
+    return 0
+
+
+def cmd_transition(args: argparse.Namespace) -> int:
+    previous = load_held(args.task)
+    status = {"start": "in_progress", "note": previous["status"], "done": "done",
+              "tested": "tested", "release": "released"}[args.command]
+    record = base_record(args.task, status, previous)
+    for key in ("message", "pr", "evidence", "preview"):
+        if getattr(args, key, None):
+            record[key] = getattr(args, key)
+    append_ledger(record)
+    print("Recorded {} for {}.".format(status, args.task))
+    return 0
+
+
+def cmd_handoff(args: argparse.Namespace) -> int:
+    """Hand paths to another agent, or ask the holder for them.
+
+    Holder without --paths: the claim is released and marked handoff.
+    Holder with --paths: those exact patterns leave the claim.
+    Non-holder: a request message; the holder's state is untouched.
+    """
+    require_origin()
+    _, records = fetch_ledger()
+    state = latest_states(records).get(args.task)
+    holder = state is not None and is_active(state) and state.get("agent") == agent_name()
+    paths = [normalise(path) for path in (args.paths or [])]
+    message: Dict[str, Any] = {
+        "kind": "message", "id": args.task, "task": args.task,
+        "agent": agent_name(), "tool": tool_name(),
+        "to": args.recipient, "status": "handoff" if holder else "requested",
+        "paths": paths or (state or {}).get("paths", []),
+        "message": args.message, "ts": iso(now_utc()),
+    }
+    if current_branch():
+        message["branch"] = current_branch()
+    append_ledger(message)
+    if holder:
+        if paths:
+            remaining = [path for path in state["paths"] if path not in paths]
+            update = base_record(args.task, state["status"], state)
+            update["paths"] = remaining
+            update["message"] = "handed off {} to {}".format(", ".join(paths), args.recipient)
+            append_ledger(update)
+            print("Handed {} to {}; {} still holds {}.".format(
+                ", ".join(paths), args.recipient, args.task,
+                ", ".join(remaining) or "nothing"))
+        else:
+            update = base_record(args.task, "handoff", state)
+            update["to"] = args.recipient
+            append_ledger(update)
+            print("Handed {} to {} and released the claim.".format(args.task, args.recipient))
+    else:
+        print("Requested {} from {}. Stop here until they respond.".format(
+            args.task, args.recipient))
+    return 0
+
+
+def format_state(item: Dict[str, Any]) -> str:
+    lines = ["{:<12} {:<12} {:<10} {}".format(
+        item.get("agent", "?"), item.get("status", "?"), item.get("task", "?"),
+        ", ".join(item.get("paths", [])) or "-")]
+    detail = []
+    if item.get("intent"):
+        detail.append(item["intent"])
+    if item.get("branch"):
+        detail.append("branch " + item["branch"])
+    if item.get("pr"):
+        detail.append("PR " + str(item["pr"]))
+    if item.get("preview"):
+        detail.append("preview " + item["preview"])
+    detail.append("updated " + local_time(item["ts"]))
+    if is_active(item):
+        detail.append("expires " + local_clock(expires_at(item)))
+    lines.append("             " + " | ".join(detail))
+    return "\n".join(lines)
+
+
+def cmd_status(_: argparse.Namespace) -> int:
+    require_origin()
+    _, records = fetch_ledger()
+    states = latest_states(records)
+    now = now_utc()
+    active = sorted((item for item in states.values() if is_active(item, now)),
+                    key=lambda entry: (entry["agent"], entry["task"]))
+    expired = [item for item in states.values()
+               if is_expired(item, now) and is_recent(item, now)]
+    finished = [item for item in states.values()
+                if item.get("status") in ("released", "handoff") and is_recent(item, now)]
+    messages = [item for item in records if is_message(item) and is_recent(item, now)]
+
+    print("Active claims ({}):".format(local_zone()) if active
+          else "No active claims.")
+    for item in active:
+        print(format_state(item))
+    if expired:
+        print("\nExpired in the last {}h (paths are free; ask before reusing):".format(
+            RECENT_HOURS))
+        for item in expired:
+            print(format_state(item))
+    if finished:
+        print("\nReleased or handed off in the last {}h:".format(RECENT_HOURS))
+        for item in finished:
+            print(format_state(item))
+    if messages:
+        print("\nMessages in the last {}h:".format(RECENT_HOURS))
+        for item in messages:
+            print("{}  {} -> {}  {}  [{}]  {}".format(
+                local_time(item["ts"]), item["agent"], item.get("to", "?"),
+                item["task"], item.get("status", "?"), item.get("message", "")))
+            if item.get("paths"):
+                print("             paths: " + ", ".join(item["paths"]))
+    return 0
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    require_origin()
+    _, records = fetch_ledger()
+    if args.task:
+        records = [item for item in records if item.get("task") == args.task]
+    if args.agent:
+        records = [item for item in records if item.get("agent") == args.agent]
+    if args.limit:
+        records = records[-args.limit:]
+    if not records:
+        print("No ledger events.")
+        return 0
+    for item in records:
+        extra = item.get("message") or item.get("evidence") or item.get("intent") or ""
+        arrow = " -> " + item["to"] if item.get("to") else ""
+        print("{}  {:<12} {:<11} {:<10} {}{}  {}".format(
+            local_time(item["ts"]), item.get("agent", "?"), item.get("status", "?"),
+            item.get("task", "?"), ", ".join(item.get("paths", [])) or "-", arrow, extra))
+    return 0
+
+
+# --- CLI --------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ncl", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version="ncl {}".format(VERSION))
+    commands = parser.add_subparsers(dest="command", metavar="command")
+    commands.required = True
+
+    def task_parser(name: str, help_text: str) -> argparse.ArgumentParser:
+        sub = commands.add_parser(name, help=help_text, description=help_text)
+        sub.add_argument("--task", required=True, help="task or issue id, e.g. WCR-42")
+        return sub
+
+    commands.add_parser("whoami", help="print AGENT_NAME or fail if it is unset")
+    commands.add_parser("status", help="show who holds what right now")
+
+    log = commands.add_parser("log", help="print ledger events, oldest first")
+    log.add_argument("--task", help="only this task")
+    log.add_argument("--agent", help="only this agent")
+    log.add_argument("-n", "--limit", type=int, help="only the last N events")
+
+    claim = task_parser("claim", "call dibs on paths before touching them")
+    claim.add_argument("--paths", nargs="+", required=True, metavar="GLOB",
+                       help="paths or globs, e.g. 'src/app/locations/**'")
+    claim.add_argument("--intent", required=True, help="one line on what you will do")
+    claim.add_argument("--ttl", type=float, default=DEFAULT_TTL_HOURS,
+                       help="hours before the claim expires (default %(default)s)")
+
+    task_parser("start", "mark a claim as in progress")
+    note = task_parser("note", "log progress or an interface change")
+    note.add_argument("message")
+    done = task_parser("done", "record that the work is committed and a PR is open")
+    done.add_argument("--pr", help="pull request number or URL")
+    tested = task_parser("tested", "record test evidence and the preview checked")
+    tested.add_argument("--evidence", required=True,
+                        help="e.g. 'CI green, preview at 390/768/1440'")
+    tested.add_argument("--preview", help="preview deployment URL")
+    task_parser("release", "release the claim after merge")
+    handoff = task_parser("handoff", "hand paths to another agent, or ask its holder for them")
+    handoff.add_argument("--to", dest="recipient", required=True,
+                         help="AGENT_NAME of the other agent")
+    handoff.add_argument("--paths", nargs="+", metavar="GLOB", help="paths involved")
+    handoff.add_argument("-m", "--message", default="",
+                         help="what the other agent needs to know")
+    return parser
+
+
+COMMANDS = {
+    "whoami": cmd_whoami,
+    "status": cmd_status,
+    "log": cmd_log,
+    "claim": cmd_claim,
+    "handoff": cmd_handoff,
+}
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    handler = COMMANDS.get(args.command, cmd_transition)
+    try:
+        return handler(args)
+    except (NclError, OSError, ValueError) as error:
+        print("ncl: {}".format(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
