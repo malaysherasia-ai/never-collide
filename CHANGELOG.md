@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0 - 2026-09-27
+
+A log inside the tool, and the commands a non-developer needs when
+something goes wrong.
+
+- `.claude/never-collide/ncl.log` (local, ignored): one JSON line per hook
+  decision (runner, mode, decision, paths, reasons), per ledger write and
+  per error. What to paste into a bug report.
+- `ncl report`: counts from the log plus the last errors and the last hook
+  questions. `--json` gives the counts alone.
+- `ncl feedback --report` attaches those counts. Never paths, never names.
+  Interactive feedback asks before attaching.
+- `ncl doctor`: Python, git, repo, origin, ledger branch, identity, config,
+  files, hook registration, git stub, workflow, log, never-again. FAIL
+  lines say what to fix.
+- `ncl uninstall [--yes]`: removes the tool's folders, the workflow, the
+  settings entry, the git stub or its line, and the CLAUDE.md block. Keeps
+  `AGENTS.md`, `.agents/`, `env.AGENT_NAME` and the ledger branch.
+
 ## 0.4.0 - 2026-09-27
 
 Opt-in usage count and feedback, and `ncl upgrade`.

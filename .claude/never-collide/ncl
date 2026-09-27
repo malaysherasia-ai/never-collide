@@ -18,7 +18,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 LEDGER_FILE = "ledger.jsonl"
 LEDGER_REF = "refs/remotes/origin/agents/ledger"
 LEDGER_BRANCH = "refs/heads/agents/ledger"
@@ -31,7 +31,7 @@ CONFIG_FILE = ".agents/never-collide.json"
 DEFAULT_CONFIG = {"enforce": "warn", "exempt": [], "cache_seconds": 120}
 ENFORCE_MODES = ("warn", "deny", "off")
 CACHE_DIR = ".ncl"
-BUILTIN_EXEMPT = [CONFIG_FILE, CACHE_DIR + "/**"]
+BUILTIN_EXEMPT = [CONFIG_FILE, CACHE_DIR + "/**", ".claude/never-collide/ncl.log"]
 HOOK_AGENTS = ("claude", "codex", "gemini", "copilot", "antigravity")
 EDIT_MATCHER = "Edit|Write|MultiEdit|NotebookEdit"
 DISPATCH_CMD = '"$CLAUDE_PROJECT_DIR"/.claude/hooks/ncl/dispatch'
@@ -275,6 +275,62 @@ def ledger_for_check(max_age_seconds: float) -> Tuple[List[Dict[str, Any]], str]
     return records, ""
 
 
+# --- local log --------------------------------------------------------------
+# One JSON line per event, inside the tool's own folder, never committed.
+# Hook decisions, ledger writes and errors: what a person pastes into a bug
+# report, and what `ncl report` counts.
+
+LOG_FILE = ".claude/never-collide/ncl.log"
+
+
+def log_path() -> str:
+    return os.path.join(repo_root(), *LOG_FILE.split("/"))
+
+
+def log_event(kind: str, **fields: Any) -> None:
+    record = {"ts": iso(now_utc()), "kind": kind}
+    record.update({key: value for key, value in fields.items() if value not in (None, "", [])})
+    try:
+        os.makedirs(os.path.dirname(log_path()), exist_ok=True)
+        with open(log_path(), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
+def read_log() -> List[Dict[str, Any]]:
+    try:
+        with open(log_path(), encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return []
+    records = []
+    for line in lines:
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            continue
+    return records
+
+
+def report_summary(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Counts only: safe to attach to feedback. No paths, no names, no text."""
+    summary: Dict[str, Any] = {"events": len(records), "ledger": {}, "hooks": {},
+                               "errors": 0, "since": None, "until": None}
+    for item in records:
+        summary["since"] = summary["since"] or item.get("ts")
+        summary["until"] = item.get("ts")
+        if item.get("kind") == "ledger":
+            key = item.get("status", "?")
+            summary["ledger"][key] = summary["ledger"].get(key, 0) + 1
+        elif item.get("kind") == "hook":
+            key = "{}:{}".format(item.get("runner", "?"), item.get("decision", "?"))
+            summary["hooks"][key] = summary["hooks"].get(key, 0) + 1
+        elif item.get("kind") == "error":
+            summary["errors"] += 1
+    return summary
+
+
 # --- config -----------------------------------------------------------------
 
 def config_path() -> str:
@@ -475,6 +531,8 @@ def append_ledger(record: Dict[str, Any], validate_claim: bool = False) -> None:
         if pushed.returncode == 0:
             git(["update-ref", LEDGER_REF, commit], check=False)
             write_cache(list(records) + [record])
+            log_event("ledger", task=record.get("task"), status=record.get("status"),
+                      agent=record.get("agent"), attempt=attempt)
             return
         if attempt == RETRY_LIMIT:
             raise NclError("could not update ledger after {} attempts: {}".format(
@@ -732,19 +790,24 @@ def cmd_check(args: argparse.Namespace) -> int:
         if note:
             print("note: " + note)
         return 2 if problems else 0
-    if not problems or mode == "off":
+    decision = "allow"
+    if problems and mode != "off":
+        decision = "deny" if mode == "deny" else "ask"
+    log_event("hook", runner=hook, agent=agent_name(required=False), mode=mode,
+              decision=decision, paths=paths, problems=problems, note=note)
+    if decision == "allow":
         return 0
     reason = "never-collide: " + "; ".join(problems)
     if note:
         reason += " (" + note + ")"
     if hook == "git":
         print(reason, file=sys.stderr)
-        if mode == "deny":
+        if decision == "deny":
             print("never-collide: commit refused (enforce is deny; ncl enforce warn relaxes it)",
                   file=sys.stderr)
             return 1
         return 0
-    print(hook_output(hook, "deny" if mode == "deny" else "ask", reason))
+    print(hook_output(hook, decision, reason))
     return 0
 
 
@@ -1037,8 +1100,13 @@ def cmd_feedback(args: argparse.Namespace) -> int:
                                    args.tools or "", args.message or "")
     elif sys.stdin.isatty():
         payload = collect_feedback_interactively()
+        if not args.report and ask("  Attach usage counts from ncl report? No paths, no names. [y/N] ") \
+                .lower() in ("y", "yes"):
+            args.report = True
     else:
         raise NclError("nothing to send; pass --message, --count, or run interactively")
+    if args.report:
+        payload["report"] = report_summary(read_log())
     if args.dry_run:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
@@ -1150,6 +1218,200 @@ def cmd_version(_: argparse.Namespace) -> int:
     return 0
 
 
+# --- report, doctor, uninstall ----------------------------------------------
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """What the local log says: counts, and the last errors. --json prints
+    the counts that `ncl feedback --report` would attach."""
+    records = read_log()
+    summary = report_summary(records)
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0
+    if not records:
+        print("No events logged yet ({}).".format(LOG_FILE))
+        return 0
+    print("never-collide {}  log {}  {} events, {} to {}".format(
+        VERSION, LOG_FILE, summary["events"],
+        local_time(summary["since"]), local_time(summary["until"])))
+    print("\nLedger writes:")
+    for key, count in sorted(summary["ledger"].items()):
+        print("  {:<12} {}".format(key, count))
+    if not summary["ledger"]:
+        print("  none")
+    print("\nHook decisions (runner:decision):")
+    for key, count in sorted(summary["hooks"].items()):
+        print("  {:<20} {}".format(key, count))
+    if not summary["hooks"]:
+        print("  none")
+    errors = [item for item in records if item.get("kind") == "error"]
+    print("\nErrors: {}".format(len(errors)))
+    for item in errors[-5:]:
+        print("  {}  ncl {}: {}".format(local_time(item["ts"]), item.get("command", "?"),
+                                        item.get("message", "")))
+    fired = [item for item in records if item.get("kind") == "hook"
+             and item.get("decision") in ("ask", "deny")]
+    if fired:
+        print("\nLast hook questions:")
+        for item in fired[-5:]:
+            print("  {}  {} {}  {}".format(local_time(item["ts"]), item.get("runner"),
+                                           item.get("decision"),
+                                           "; ".join(item.get("problems", []))[:120]))
+    return 0
+
+
+def cmd_doctor(_: argparse.Namespace) -> int:
+    """Check the setup and say what is wrong in plain words."""
+    root = repo_root()
+    lines: List[Tuple[str, str]] = []
+
+    def check(ok: Optional[bool], text: str) -> None:
+        lines.append(("OK  " if ok else ("WARN" if ok is None else "FAIL"), text))
+
+    check(sys.version_info >= (3, 7), "python {}.{}.{}".format(*sys.version_info[:3]))
+    version = git(["--version"], check=False)
+    check(version.returncode == 0, version.stdout.strip() or "git not found")
+    inside = git(["rev-parse", "--is-inside-work-tree"], check=False).returncode == 0
+    check(inside, "inside a git repository: {}".format(root))
+    origin = git(["remote", "get-url", "origin"], check=False)
+    check(origin.returncode == 0, "origin remote: " + (origin.stdout.strip() or "missing"))
+    if origin.returncode == 0:
+        reach = git(["ls-remote", "--heads", "origin", "agents/ledger"], check=False)
+        if reach.returncode:
+            check(False, "origin unreachable: " + reach.stderr.strip()[:100])
+        else:
+            check(True if reach.stdout.strip() else None,
+                  "ledger branch agents/ledger " + ("present" if reach.stdout.strip()
+                                                    else "not created yet (first claim creates it)"))
+    agent = agent_name(required=False)
+    check(agent != "unknown", "AGENT_NAME: " + (agent if agent != "unknown" else "unset"))
+    try:
+        config = load_config()
+        check(True, "{}: enforce {}".format(CONFIG_FILE, config["enforce"]))
+    except NclError as error:
+        check(False, str(error))
+    for relative in (".claude/never-collide/ncl", ".claude/hooks/ncl/dispatch",
+                     ".claude/hooks/ncl/pre-commit", ".claude/skills/never-collide/SKILL.md"):
+        check(os.path.isfile(os.path.join(root, *relative.split("/"))), relative)
+    settings_path = os.path.join(root, ".claude", "settings.json")
+    registered = False
+    if os.path.isfile(settings_path):
+        try:
+            with open(settings_path, encoding="utf-8") as handle:
+                registered = "hooks/ncl/dispatch" in handle.read().replace("\\", "/")
+        except OSError:
+            pass
+    check(registered, ".claude/settings.json registers the edit hook")
+    hooks_dir = git(["rev-parse", "--git-path", "hooks"], check=False).stdout.strip()
+    stub = os.path.join(root if not os.path.isabs(hooks_dir) else "", hooks_dir, "pre-commit")
+    stub_ok = False
+    if os.path.isfile(stub):
+        with open(stub, encoding="utf-8") as handle:
+            stub_ok = "hooks/ncl/pre-commit" in handle.read()
+    check(stub_ok, ".git/hooks/pre-commit calls never-collide")
+    workflow = os.path.join(root, ".github", "workflows", "never-collide.yml")
+    check(True if os.path.isfile(workflow) else None,
+          ".github/workflows/never-collide.yml " + ("present" if os.path.isfile(workflow)
+                                                    else "absent (no PR check)"))
+    try:
+        os.makedirs(os.path.dirname(log_path()), exist_ok=True)
+        with open(log_path(), "a", encoding="utf-8"):
+            pass
+        check(True, LOG_FILE + " writable")
+    except OSError as error:
+        check(False, "{} not writable: {}".format(LOG_FILE, error))
+    never_again = os.path.isfile(os.path.join(root, ".claude", "never-again", "na"))
+    check(True if never_again else None,
+          "never-again " + ("installed alongside" if never_again else "not installed (optional)"))
+
+    for status, text in lines:
+        print("{} {}".format(status, text))
+    failures = [text for status, text in lines if status == "FAIL"]
+    if failures:
+        print("\n{} problem(s). Fix the FAIL lines, or send this to ncl feedback.".format(len(failures)))
+        return 1
+    print("\nAll good.")
+    return 0
+
+
+UNINSTALL_PATHS = (".claude/never-collide", ".claude/hooks/ncl", ".claude/skills/never-collide")
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    """Remove never-collide from this repo. Keeps AGENTS.md, .agents/ and the
+    ledger branch: those are the team's, not the tool's."""
+    import shutil
+    root = repo_root()
+    if not args.yes and ask("  Remove never-collide from {}? [y/N] ".format(root)).lower() \
+            not in ("y", "yes"):
+        print("  Nothing changed.")
+        return 1
+    removed = []
+    for relative in UNINSTALL_PATHS:
+        full = os.path.join(root, *relative.split("/"))
+        if os.path.isdir(full):
+            shutil.rmtree(full, ignore_errors=True)
+            removed.append(relative + "/")
+    workflow = os.path.join(root, ".github", "workflows", "never-collide.yml")
+    if os.path.isfile(workflow):
+        os.remove(workflow)
+        removed.append(".github/workflows/never-collide.yml")
+
+    settings_path = os.path.join(root, ".claude", "settings.json")
+    if os.path.isfile(settings_path):
+        try:
+            with open(settings_path, encoding="utf-8") as handle:
+                settings = json.loads(handle.read() or "{}")
+            groups = settings.get("hooks", {}).get("PreToolUse", [])
+            kept = [group for group in groups
+                    if not any("hooks/ncl/dispatch" in str(hook.get("command", "")).replace("\\", "/")
+                               for hook in (group or {}).get("hooks", []) or [])]
+            if len(kept) != len(groups):
+                settings["hooks"]["PreToolUse"] = kept
+                if not kept:
+                    del settings["hooks"]["PreToolUse"]
+                if not settings["hooks"]:
+                    del settings["hooks"]
+                with open(settings_path, "w", encoding="utf-8", newline="\n") as handle:
+                    json.dump(settings, handle, indent=2)
+                    handle.write("\n")
+                removed.append(".claude/settings.json edit-hook entry (env.AGENT_NAME kept)")
+        except (OSError, ValueError) as error:
+            print("  could not edit .claude/settings.json: {}".format(error))
+
+    hooks_dir = git(["rev-parse", "--git-path", "hooks"], check=False).stdout.strip()
+    if hooks_dir:
+        stub = os.path.join(root if not os.path.isabs(hooks_dir) else "", hooks_dir, "pre-commit")
+        if os.path.isfile(stub):
+            with open(stub, encoding="utf-8") as handle:
+                text = handle.read()
+            if text == GIT_STUB:
+                os.remove(stub)
+                removed.append(".git/hooks/pre-commit stub")
+            elif GIT_STUB_LINE in text:
+                lines = [line for line in text.splitlines() if line != GIT_STUB_LINE]
+                with open(stub, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write("\n".join(lines) + "\n")
+                removed.append("never-collide line in .git/hooks/pre-commit")
+
+    claude_md = os.path.join(root, "CLAUDE.md")
+    if os.path.isfile(claude_md):
+        with open(claude_md, encoding="utf-8") as handle:
+            text = handle.read()
+        cleaned = re.sub(r"\n?<!-- never-collide:start -->.*?<!-- never-collide:end -->\n?",
+                         "\n", text, flags=re.S)
+        if cleaned != text:
+            with open(claude_md, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(cleaned)
+            removed.append("CLAUDE.md never-collide block")
+
+    for item in removed:
+        print("  removed  " + item)
+    print("  kept     AGENTS.md, .agents/ (ownership, protocol, config), the agents/ledger "
+          "branch on origin, .gitignore lines")
+    return 0
+
+
 # --- CLI --------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1232,6 +1494,8 @@ def build_parser() -> argparse.ArgumentParser:
     feedback.add_argument("--email")
     feedback.add_argument("--tools", help="which tools share your repo")
     feedback.add_argument("-m", "--message")
+    feedback.add_argument("--report", action="store_true",
+                          help="attach the counts from ncl report --json (no paths, no names)")
     feedback.add_argument("--dry-run", action="store_true", help="print the payload, send nothing")
     feedback.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
     feedback.add_argument("--install-prompt", action="store_true", help=argparse.SUPPRESS)
@@ -1242,6 +1506,12 @@ def build_parser() -> argparse.ArgumentParser:
     upgrade.add_argument("--from", dest="source", metavar="DIR", help="install from a local clone")
 
     commands.add_parser("version", help="print the installed version")
+
+    report = commands.add_parser("report", help="what the local log says: counts and last errors")
+    report.add_argument("--json", action="store_true", help="the counts feedback would attach")
+    commands.add_parser("doctor", help="check the setup and say what is wrong")
+    uninstall = commands.add_parser("uninstall", help="remove never-collide from this repo")
+    uninstall.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
     return parser
 
 
@@ -1258,6 +1528,9 @@ COMMANDS = {
     "feedback": cmd_feedback,
     "upgrade": cmd_upgrade,
     "version": cmd_version,
+    "report": cmd_report,
+    "doctor": cmd_doctor,
+    "uninstall": cmd_uninstall,
 }
 
 
@@ -1268,6 +1541,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return handler(args)
     except (NclError, OSError, ValueError) as error:
         print("ncl: {}".format(error), file=sys.stderr)
+        log_event("error", command=args.command, message=str(error))
         return 1
 
 

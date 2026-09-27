@@ -167,6 +167,24 @@ ncl feedback --dry-run -m '...'   # shows the payload, sends nothing
 `NCL_NO_PROMPT=1` means never ask; CI is never asked. What the endpoint
 receives and stores is in [docs/feedback-endpoint.md](docs/feedback-endpoint.md).
 
+## When something goes wrong
+
+The tool never edits your source files. It reads paths and appends one line
+to a separate branch. The worst a bug can do is ask about, or refuse, an
+edit or a commit, and `ncl enforce off` ends that.
+
+- **The log.** `.claude/never-collide/ncl.log` (local, never committed)
+  records every hook decision with its paths and reasons, every ledger
+  write and every error. `ncl report` summarises it: counts, the last
+  errors, the last hook questions. Paste either into an issue.
+- **`ncl doctor`** checks Python, git, the origin, the ledger branch, your
+  identity, the config, the files, the hook registration and the git stub,
+  and says in plain words what to fix.
+- **`ncl feedback --report`** attaches the counts from the log to what you
+  send. Counts only: no paths, no names, no message text.
+- **`ncl uninstall`** removes everything the installer added and leaves
+  `AGENTS.md`, `.agents/` and the ledger branch, which are yours.
+
 ## Upgrade
 
 ```sh
