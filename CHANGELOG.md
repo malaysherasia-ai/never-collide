@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1 - 2026-09-27
+
+- `ncl upgrade` falls back to the full releases list when GitHub's
+  `releases/latest` answers 404, which it does while every release is a
+  pre-release. Found on the first real `ncl upgrade --check` against the
+  published repo.
+
 ## 0.6.0 - 2026-09-27
 
 Other tools, and identity without environment variables. Built after
