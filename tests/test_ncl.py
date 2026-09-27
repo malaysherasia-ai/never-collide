@@ -632,5 +632,101 @@ class UpgradeTests(RepoFixture):
         self.assertIn("could not reach GitHub", result.stderr)
 
 
+class LogAndReportTests(RepoFixture):
+    def log_lines(self):
+        path = self.repo / ".claude" / "never-collide" / "ncl.log"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_ledger_writes_hook_decisions_and_errors_are_logged(self):
+        self.ncl("claude", "claim", "--task", "T-1", "--paths", "src/**", "--intent", "x")
+        payload = json.dumps({"tool_input": {"file_path": str(self.repo / "docs" / "a.md")}})
+        self.ncl("claude", "check", "--hook", "claude", "--payload", stdin=payload)
+        self.ncl("claude", "check", "--hook", "claude", "--payload",
+                 stdin=json.dumps({"tool_input": {"file_path": str(self.repo / "src" / "a.ts")}}))
+        self.ncl("antigravity", "done", "--task", "T-1", expect=1)
+
+        kinds = [(item["kind"], item.get("status") or item.get("decision") or item.get("command"))
+                 for item in self.log_lines()]
+        self.assertEqual(kinds, [("ledger", "claimed"), ("hook", "ask"), ("hook", "allow"),
+                                 ("error", "done")])
+        asked = self.log_lines()[1]
+        self.assertEqual(asked["paths"], ["docs/a.md"])
+        self.assertEqual(asked["mode"], "warn")
+
+        report = self.ncl("claude", "report").stdout
+        self.assertIn("claimed      1", report)
+        self.assertIn("claude:ask           1", report)
+        self.assertIn("Errors: 1", report)
+        self.assertIn("is held by claude", report)
+
+        summary = json.loads(self.ncl("claude", "report", "--json").stdout)
+        self.assertEqual(summary["events"], 4)
+        self.assertEqual(summary["hooks"], {"claude:ask": 1, "claude:allow": 1})
+        self.assertNotIn("paths", json.dumps(summary))
+
+    def test_empty_report(self):
+        self.assertIn("No events logged yet", self.ncl("claude", "report").stdout)
+
+    def test_feedback_report_attaches_counts_only(self):
+        self.ncl("claude", "claim", "--task", "T-1", "--paths", "src/secret/**", "--intent", "x")
+        result = self.ncl("claude", "feedback", "--dry-run", "--count", "--report")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["report"]["ledger"], {"claimed": 1})
+        self.assertNotIn("secret", result.stdout)
+
+
+class DoctorAndUninstallTests(RepoFixture):
+    def test_doctor_reports_and_uninstall_reverts(self):
+        env = os.environ.copy()
+        env["NCL_NO_PROMPT"] = "1"
+        install = run(["bash", str(ROOT / "install.sh"), str(self.repo)], ROOT, env)
+        self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+        (self.repo / "CLAUDE.md").write_text("# Mine\n\n<!-- never-collide:start -->\n@AGENTS.md\n"
+                                             "<!-- never-collide:end -->\n", encoding="utf-8")
+
+        without_name = self.ncl(None, "doctor", expect=1)
+        self.assertIn("FAIL AGENT_NAME: unset", without_name.stdout)
+        healthy = self.ncl("claude", "doctor")
+        self.assertIn("All good", healthy.stdout)
+        self.assertIn("OK   .claude/settings.json registers the edit hook", healthy.stdout)
+        self.assertIn("OK   .git/hooks/pre-commit calls never-collide", healthy.stdout)
+        self.assertIn("WARN ledger branch agents/ledger not created yet", healthy.stdout)
+
+        declined = self.ncl("claude", "uninstall", expect=1, stdin="n\n")
+        self.assertIn("Nothing changed", declined.stdout)
+        self.assertTrue((self.repo / ".claude" / "hooks" / "ncl" / "dispatch").exists())
+
+        removed = self.ncl("claude", "uninstall", "--yes").stdout
+        self.assertIn("removed  .claude/hooks/ncl/", removed)
+        self.assertIn("removed  .git/hooks/pre-commit stub", removed)
+        self.assertIn("removed  CLAUDE.md never-collide block", removed)
+        self.assertFalse((self.repo / ".claude" / "never-collide").exists())
+        self.assertFalse((self.repo / ".claude" / "skills" / "never-collide").exists())
+        self.assertFalse((self.repo / ".github" / "workflows" / "never-collide.yml").exists())
+        settings = json.loads((self.repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        self.assertNotIn("hooks", settings)
+        self.assertEqual(settings["env"]["AGENT_NAME"], "claude")
+        self.assertEqual((self.repo / "CLAUDE.md").read_text(encoding="utf-8").strip(), "# Mine")
+        self.assertTrue((self.repo / "AGENTS.md").exists())
+        self.assertTrue((self.repo / ".agents" / "never-collide.json").exists())
+
+    def test_uninstall_leaves_a_never_again_stub_in_place(self):
+        env = os.environ.copy()
+        env["NCL_NO_PROMPT"] = "1"
+        hooks_dir = pathlib.Path(self.git("rev-parse", "--git-path", "hooks").strip())
+        if not hooks_dir.is_absolute():
+            hooks_dir = self.repo / hooks_dir
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        (hooks_dir / "pre-commit").write_text(
+            '#!/bin/sh\n# never-again pre-commit stub\nr="x"\nexec "$r" "$@"\n', encoding="utf-8")
+        run(["bash", str(ROOT / "install.sh"), str(self.repo)], ROOT, env)
+        self.assertIn("hooks/ncl/pre-commit", (hooks_dir / "pre-commit").read_text(encoding="utf-8"))
+        self.ncl("claude", "uninstall", "--yes")
+        self.assertEqual((hooks_dir / "pre-commit").read_text(encoding="utf-8"),
+                         '#!/bin/sh\n# never-again pre-commit stub\nr="x"\nexec "$r" "$@"\n')
+
+
 if __name__ == "__main__":
     unittest.main()

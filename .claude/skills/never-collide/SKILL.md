@@ -51,3 +51,5 @@ The commit hook checks the same thing for every staged file. A commit on
 - `ncl enforce` prints the current mode; `ncl enforce deny` stops
   unclaimed edits instead of asking. Only a person changes this.
 - `ncl check <path>` says whether you may edit a path, without a hook.
+- `ncl doctor` when anything looks wrong; `ncl report` for what the hooks
+  decided and why. Both read `.claude/never-collide/ncl.log`.

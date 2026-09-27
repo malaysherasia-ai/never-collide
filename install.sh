@@ -85,6 +85,10 @@ if ! grep -qxF '.ncl/' "$ignore_file"; then
     printf '\n# never-collide (local only)\n.ncl/\n' >> "$ignore_file"
     echo "  gitignore  .ncl/ ignored"
 fi
+if ! grep -qxF '.claude/never-collide/ncl.log' "$ignore_file"; then
+    printf '.claude/never-collide/ncl.log\n' >> "$ignore_file"
+    echo "  gitignore  .claude/never-collide/ncl.log ignored (the local log)"
+fi
 
 (cd "$target_dir" && "$py" .claude/never-collide/ncl install-hooks)
 
