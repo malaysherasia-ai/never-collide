@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# never-collide hook dispatcher. Installed as .claude/hooks/ncl/dispatch.
+#
+# One entry in the agent's hook config points here. Claude Code's
+# settings.json calls it before Edit, Write, MultiEdit and NotebookEdit with
+# the tool payload on stdin; the git pre-commit runner calls it with
+# NCL_EVENT=git and no stdin. It finds an interpreter and the repo, then hands
+# the payload to `ncl check --hook`, which decides: allow when every path the
+# call touches is covered by an active claim held by this agent; otherwise
+# ask (warn mode) or deny (deny mode). The mode lives in
+# .agents/never-collide.json and is changed with `ncl enforce`.
+#
+#   dispatch [--agent claude|codex|gemini|copilot|antigravity]
+#
+# The agent name selects the output dialect. It defaults to claude.
+set -uo pipefail
+
+NCL_AGENT="${NCL_AGENT:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent) NCL_AGENT="${2:-}"; shift ;;
+    --agent=*) NCL_AGENT="${1#--agent=}" ;;
+  esac
+  shift
+done
+
+PAYLOAD=""
+[ "${NCL_EVENT:-}" = "git" ] || PAYLOAD="$(cat)"
+
+# Resolve a Python that actually runs. On Windows `command -v python3` finds
+# the Microsoft Store stub, which exists and exits non-zero having run nothing.
+ncl_python() {
+  local c
+  for c in "${NCL_PYTHON:-}" python3 python py; do
+    [ -n "$c" ] || continue
+    if "$c" -c 'import sys' >/dev/null 2>&1; then
+      command -v "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Git Bash reports /c/Users/...; the Python it calls needs C:/Users/... .
+native_path() {
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) command -v cygpath >/dev/null 2>&1 && cygpath -m "$1" && return 0 ;;
+  esac
+  printf '%s\n' "$1"
+}
+
+if ! PY="$(ncl_python)"; then
+  if [ "${NCL_EVENT:-}" = "git" ]; then
+    echo "never-collide: no working python found; no check ran. Install Python 3.7+ or set NCL_PYTHON." >&2
+  else
+    printf '{"systemMessage":"never-collide: no working python found; no check ran. Install Python 3.7+ or set NCL_PYTHON."}\n'
+  fi
+  exit 0
+fi
+
+# The repo: CLAUDE_PROJECT_DIR from Claude Code, else the payload's working
+# directory ("cwd" at the top for most agents, "Cwd" in the arguments for
+# Antigravity), else where we are.
+ROOT="${CLAUDE_PROJECT_DIR:-}"
+if [ -z "$ROOT" ] && [ -n "$PAYLOAD" ]; then
+  CWD="$(printf '%s' "$PAYLOAD" | sed -n 's/.*"[cC]wd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  CWD="${CWD//\\\\//}"
+  [ -n "$CWD" ] && [ -d "$CWD" ] && ROOT="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || true)"
+fi
+[ -n "$ROOT" ] || ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ROOT="$(native_path "$ROOT")"
+CLI="$ROOT/.claude/never-collide/ncl"
+[ -f "$CLI" ] || exit 0   # not installed here; never lock an agent out
+
+export PYTHONIOENCODING=utf-8 PYTHONUTF8=1
+if [ "${NCL_EVENT:-}" = "git" ]; then
+  exec "$PY" "$CLI" check --hook git --staged
+fi
+printf '%s' "$PAYLOAD" | exec "$PY" "$CLI" check --hook "${NCL_AGENT:-claude}" --payload

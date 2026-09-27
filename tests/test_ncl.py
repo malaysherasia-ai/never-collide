@@ -18,8 +18,8 @@ ncl = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(ncl)
 
 
-def run(command, cwd, env=None):
-    return subprocess.run(command, cwd=str(cwd), env=env, text=True,
+def run(command, cwd, env=None, stdin=None):
+    return subprocess.run(command, cwd=str(cwd), env=env, text=True, input=stdin,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -88,11 +88,13 @@ class RepoFixture(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
-    def ncl(self, agent, *args, expect=0):
+    def ncl(self, agent, *args, expect=0, stdin=None):
         env = os.environ.copy()
-        env["AGENT_NAME"] = agent
         env.pop("AGENT_TOOL", None)
-        result = run([sys.executable, str(SCRIPT)] + list(args), self.repo, env)
+        env.pop("AGENT_NAME", None)
+        if agent:
+            env["AGENT_NAME"] = agent
+        result = run([sys.executable, str(SCRIPT)] + list(args), self.repo, env, stdin)
         if expect is not None:
             self.assertEqual(result.returncode, expect, result.stdout + result.stderr)
         return result
@@ -227,6 +229,210 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(claude.count("<!-- never-collide:start -->"), 1)
             ignore = (target / ".gitignore").read_text(encoding="utf-8")
             self.assertEqual(ignore.count(".ncl/"), 1)
+
+
+class PathMatchTests(unittest.TestCase):
+    def test_double_star_spans_directories(self):
+        self.assertTrue(ncl.path_matches("src/app/**", "src/app/a/b/page.tsx"))
+        self.assertTrue(ncl.path_matches("src/app/**/page.tsx", "src/app/page.tsx"))
+        self.assertTrue(ncl.path_matches("src/app/**/page.tsx", "src/app/x/y/page.tsx"))
+        self.assertTrue(ncl.path_matches("**/*.py", "tests/test_ncl.py"))
+        self.assertTrue(ncl.path_matches("**/*.py", "setup.py"))
+        self.assertTrue(ncl.path_matches("**", "anything/at/all"))
+
+    def test_single_star_stays_in_one_segment(self):
+        self.assertTrue(ncl.path_matches("src/app/*.tsx", "src/app/page.tsx"))
+        self.assertFalse(ncl.path_matches("src/app/*.tsx", "src/app/x/page.tsx"))
+        self.assertFalse(ncl.path_matches("src/lib/**", "src/library/db.ts"))
+
+    def test_literal_pattern_covers_the_subtree(self):
+        self.assertTrue(ncl.path_matches("src/lib", "src/lib/db.ts"))
+        self.assertTrue(ncl.path_matches("src/lib/db.ts", "src/lib/db.ts"))
+        self.assertFalse(ncl.path_matches("src/lib", "src/lib2/db.ts"))
+
+    def test_relative_to_root(self):
+        root = "C:/work/site" if os.name == "nt" else "/work/site"
+        self.assertEqual(ncl.relative_to_root(root + "/src/app/page.tsx", root), "src/app/page.tsx")
+        self.assertEqual(ncl.relative_to_root("src\\app\\page.tsx", root), "src/app/page.tsx")
+        self.assertIsNone(ncl.relative_to_root(root + "-other/x.ts", root))
+        self.assertIsNone(ncl.relative_to_root("/elsewhere/x.ts", root))
+
+    def test_payload_paths_for_each_agent_shape(self):
+        claude = json.dumps({"tool_name": "Edit", "tool_input": {"file_path": "/r/a.ts"}})
+        antigravity = json.dumps({"toolCall": {"args": {"TargetFile": "/r/b.ts", "Cwd": "/r"}}})
+        copilot = json.dumps({"toolName": "edit", "toolArgs": {"path": "/r/c.ts"}})
+        self.assertEqual(ncl.payload_paths(claude), ["/r/a.ts"])
+        self.assertEqual(ncl.payload_paths("\ufeff" + antigravity), ["/r/b.ts"])
+        self.assertEqual(ncl.payload_paths(copilot), ["/r/c.ts"])
+        self.assertEqual(ncl.payload_paths("not json"), [])
+        self.assertEqual(ncl.payload_paths(json.dumps({"tool_input": {"command": "ls"}})), [])
+
+
+class CheckTests(RepoFixture):
+    def payload(self, relative):
+        return json.dumps({"tool_name": "Write",
+                           "tool_input": {"file_path": str(self.repo / relative)}})
+
+    def test_check_reports_unclaimed_then_covered(self):
+        result = self.ncl("claude", "check", "src/app/page.tsx", expect=2)
+        self.assertIn("src/app/page.tsx is not claimed by claude", result.stdout)
+        self.ncl("claude", "claim", "--task", "T-1", "--paths", "src/app/**", "--intent", "x")
+        self.ncl("claude", "check", "src/app/page.tsx", "src/app/x/y.tsx")
+        held = self.ncl("antigravity", "check", "src/app/page.tsx", expect=2)
+        self.assertIn("is held by claude (T-1)", held.stdout)
+
+    def test_check_without_agent_name(self):
+        result = self.ncl(None, "check", "src/app/page.tsx", expect=2)
+        self.assertIn("AGENT_NAME is unset", result.stdout)
+
+    def test_hook_modes(self):
+        payload = self.payload("src/app/page.tsx")
+        asked = self.ncl("claude", "check", "--hook", "claude", "--payload", stdin=payload)
+        decision = json.loads(asked.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "ask")
+        self.assertIn("not claimed by claude", decision["permissionDecisionReason"])
+
+        self.ncl("claude", "enforce", "deny")
+        denied = self.ncl("claude", "check", "--hook", "claude", "--payload", stdin=payload)
+        self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"],
+                         "deny")
+
+        self.ncl("claude", "enforce", "off")
+        quiet = self.ncl("claude", "check", "--hook", "claude", "--payload", stdin=payload)
+        self.assertEqual(quiet.stdout.strip(), "")
+        self.assertEqual(self.ncl("claude", "enforce").stdout.strip(), "off")
+
+        self.ncl("claude", "enforce", "warn")
+        self.ncl("claude", "claim", "--task", "T-1", "--paths", "src/app/**", "--intent", "x")
+        allowed = self.ncl("claude", "check", "--hook", "claude", "--payload", stdin=payload)
+        self.assertEqual(allowed.stdout.strip(), "")
+
+    def test_hook_dialects(self):
+        payload = self.payload("src/app/page.tsx")
+        gemini = json.loads(self.ncl("claude", "check", "--hook", "gemini", "--payload",
+                                     stdin=payload).stdout)
+        self.assertIn("systemMessage", gemini)
+        antigravity = json.loads(self.ncl("claude", "check", "--hook", "antigravity",
+                                          "--payload", stdin=payload).stdout)
+        self.assertEqual(antigravity["decision"], "ask")
+        self.assertTrue(antigravity["allow_tool"])
+        codex = json.loads(self.ncl("claude", "check", "--hook", "codex", "--payload",
+                                    stdin=payload).stdout)
+        self.assertEqual(codex["hookSpecificOutput"]["permissionDecision"], "allow")
+        self.assertIn("additionalContext", codex["hookSpecificOutput"])
+
+    def test_paths_outside_repo_and_exempt_paths_are_allowed(self):
+        outside = json.dumps({"tool_input": {"file_path": str(self.root / "elsewhere.txt")}})
+        self.assertEqual(self.ncl("claude", "check", "--hook", "claude", "--payload",
+                                  stdin=outside).stdout.strip(), "")
+        (self.repo / ".agents").mkdir()
+        (self.repo / ".agents" / "never-collide.json").write_text(
+            json.dumps({"enforce": "warn", "exempt": ["docs/**"]}), encoding="utf-8")
+        self.ncl("claude", "check", "docs/notes.md")
+        self.ncl("claude", "check", "src/x.ts", expect=2)
+
+    def test_git_hook_warns_then_denies(self):
+        self.git("checkout", "-q", "-b", "claude/T-1")
+        (self.repo / "a.txt").write_text("x\n", encoding="utf-8")
+        self.git("add", "a.txt")
+        warned = self.ncl("claude", "check", "--hook", "git", "--staged")
+        self.assertIn("a.txt is not claimed by claude", warned.stderr)
+
+        self.ncl("claude", "enforce", "deny")
+        refused = self.ncl("claude", "check", "--hook", "git", "--staged", expect=1)
+        self.assertIn("commit refused", refused.stderr)
+
+        self.ncl("claude", "claim", "--task", "T-1", "--paths", "a.txt", "--intent", "x")
+        clean = self.ncl("claude", "check", "--hook", "git", "--staged")
+        self.assertEqual(clean.stderr.strip(), "")
+
+        self.git("checkout", "-q", "-b", "main")
+        on_main = self.ncl("claude", "check", "--hook", "git", "--staged", expect=1)
+        self.assertIn("commit is on main", on_main.stderr)
+
+    def test_check_uses_cache_when_origin_is_unreachable(self):
+        self.ncl("claude", "claim", "--task", "T-1", "--paths", "src/**", "--intent", "x")
+        self.git("remote", "set-url", "origin", str(self.root / "gone.git"))
+        (self.repo / ".ncl" / "fetched_at").write_text("2000-01-01T00:00:00Z", encoding="utf-8")
+        result = self.ncl("claude", "check", "src/a.ts")
+        self.assertIn("note: could not fetch the ledger", result.stdout)
+
+
+class InstallHooksTests(RepoFixture):
+    def test_install_hooks_registers_claude_and_git(self):
+        first = self.ncl("claude", "install-hooks").stdout
+        self.assertIn("never-collide.json created", first)
+        self.assertIn("AGENT_NAME=claude", first)
+        self.assertIn("pre-commit stub installed", first)
+        settings = json.loads((self.repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(settings["env"]["AGENT_NAME"], "claude")
+        group = settings["hooks"]["PreToolUse"][0]
+        self.assertEqual(group["matcher"], ncl.EDIT_MATCHER)
+        self.assertIn("hooks/ncl/dispatch", group["hooks"][0]["command"])
+
+        second = self.ncl("claude", "install-hooks").stdout
+        self.assertIn("kept", second)
+        self.assertIn("already registers", second)
+        self.assertIn("already calls never-collide", second)
+        settings_again = json.loads((self.repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(settings_again["hooks"]["PreToolUse"]), 1)
+
+    def test_install_hooks_keeps_existing_settings_and_joins_never_again_stub(self):
+        claude_dir = self.repo / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / "settings.json").write_text(json.dumps({
+            "env": {"AGENT_NAME": "codex"},
+            "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/na/dispatch"}]}]},
+        }), encoding="utf-8")
+        hooks_dir = pathlib.Path(self.git("rev-parse", "--git-path", "hooks").strip())
+        if not hooks_dir.is_absolute():
+            hooks_dir = self.repo / hooks_dir
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        stub = hooks_dir / "pre-commit"
+        stub.write_text('#!/bin/sh\n# never-again pre-commit stub\nr="x"\nexec "$r" "$@"\n',
+                        encoding="utf-8")
+        out = self.ncl("claude", "install-hooks").stdout
+        self.assertIn("added to the never-again pre-commit stub", out)
+        lines = stub.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[-1], 'exec "$r" "$@"')
+        self.assertIn("hooks/ncl/pre-commit", lines[-2])
+        settings = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(settings["env"]["AGENT_NAME"], "codex")
+        self.assertEqual(len(settings["hooks"]["PreToolUse"]), 2)
+
+
+class EndToEndCommitTests(RepoFixture):
+    """install.sh into a real clone, then commit through git's own hook."""
+
+    def test_installed_hook_guards_real_commits(self):
+        install = run(["bash", str(ROOT / "install.sh"), str(self.repo)], ROOT)
+        self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "install never-collide")
+        self.git("checkout", "-q", "-b", "claude/T-1")
+        self.ncl("claude", "enforce", "deny")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "a.ts").write_text("export {}\n", encoding="utf-8")
+        self.git("add", "-A")
+
+        env = os.environ.copy()
+        env["AGENT_NAME"] = "claude"
+        refused = run(["git", "commit", "-q", "-m", "unclaimed"], self.repo, env)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("src/a.ts is not claimed by claude", refused.stderr)
+
+        self.ncl("claude", "claim", "--task", "T-1", "--paths", "src/**", "--intent", "x")
+        allowed = run(["git", "commit", "-q", "-m", "claimed"], self.repo, env)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+
+        dispatch = run(["bash", str(self.repo / ".claude" / "hooks" / "ncl" / "dispatch")],
+                       self.repo, env, stdin=json.dumps({"tool_name": "Edit", "tool_input": {
+                           "file_path": str(self.repo / "README.md")}}))
+        self.assertEqual(dispatch.returncode, 0, dispatch.stderr)
+        decision = json.loads(dispatch.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("README.md is not claimed", decision["permissionDecisionReason"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,5 @@
+{
+  "cache_seconds": 120,
+  "enforce": "warn",
+  "exempt": []
+}

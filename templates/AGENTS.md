@@ -15,5 +15,8 @@ file. `ncl` below means `python .claude/never-collide/ncl`.
    --evidence '<what you checked>' --preview <url>`.
 7. **Release.** After merge, `ncl release --task <id>`.
 
-Ownership boundaries are in `.agents/OWNERSHIP.md`; the ledger protocol is
-in `.agents/PROTOCOL.md`. Never commit directly to `main`.
+An edit hook and the git pre-commit hook check every path against the
+ledger. When one asks about an unclaimed path, claim it or hand off; never
+proceed past the question. Ownership boundaries are in
+`.agents/OWNERSHIP.md`; the ledger protocol is in `.agents/PROTOCOL.md`.
+Never commit directly to `main`.

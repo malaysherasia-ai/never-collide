@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.0 - 2026-09-27
+
+Enforcement: hooks that check claims before an edit and before a commit.
+
+- `ncl check [PATH...] [--staged] [--payload] [--hook RUNNER]`: is every path
+  covered by an active claim held by this agent? Names the holder otherwise.
+- Claude Code edit hook: `.claude/hooks/ncl/dispatch`, registered on
+  `Edit|Write|MultiEdit|NotebookEdit` by the installer. Warn mode asks with
+  the reason; deny mode refuses. Answers in the dialect of `--agent claude`,
+  `codex`, `gemini`, `copilot` or `antigravity`; only Claude Code is wired
+  and tested.
+- Git pre-commit hook: `.claude/hooks/ncl/pre-commit` behind a stub in
+  `.git/hooks/pre-commit`, checking the staged files from any tool or
+  terminal. Commits on `main` are flagged. Shares the stub with never-again.
+- `ncl enforce [warn|deny|off]`, stored in `.agents/never-collide.json`
+  with `exempt` paths and the cache age. Every hook starts in warn mode.
+- Real glob matching for coverage: `**` spans directories, `*` and `?` stay
+  in one segment, a literal path covers its subtree.
+- Local ledger cache in `.ncl/` (ignored), refreshed by any fetch or push and
+  used by hooks while fresh, or when offline.
+- `ncl install-hooks` (run by the installer): config, settings merge, git stub.
+- `ncl.cmd` for PowerShell and cmd. Claude Code skill at
+  `.claude/skills/never-collide/SKILL.md`.
+- Tests: glob matching, payload shapes, hook modes and dialects, the git
+  runner, the installer, and a real commit refused then allowed through
+  git's own hook.
+
 ## 0.1.0 - 2026-09-27
 
 First release: the ledger CLI.

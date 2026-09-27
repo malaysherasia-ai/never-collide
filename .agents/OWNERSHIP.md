@@ -13,4 +13,6 @@ Suggested adopter boundaries from the project brief:
   configuration, and CI.
 - Shared by contract: `src/types/**`.
 
-These are starter examples, not enforced rules in version 0.1.0.
+These are starter boundaries. Claims are checked by the hooks; the
+boundaries themselves are a convention, enforced by a linter such as
+`dependency-cruiser` or ESLint `no-restricted-imports` if you add one.

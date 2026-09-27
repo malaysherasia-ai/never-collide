@@ -11,12 +11,14 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
+import stat
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 LEDGER_FILE = "ledger.jsonl"
 LEDGER_REF = "refs/remotes/origin/agents/ledger"
 LEDGER_BRANCH = "refs/heads/agents/ledger"
@@ -24,6 +26,16 @@ ACTIVE_STATUSES = ("claimed", "in_progress", "done", "tested")
 DEFAULT_TTL_HOURS = 4.0
 RETRY_LIMIT = 4
 RECENT_HOURS = 24
+
+CONFIG_FILE = ".agents/never-collide.json"
+DEFAULT_CONFIG = {"enforce": "warn", "exempt": [], "cache_seconds": 120}
+ENFORCE_MODES = ("warn", "deny", "off")
+CACHE_DIR = ".ncl"
+HOOK_AGENTS = ("claude", "codex", "gemini", "copilot", "antigravity")
+EDIT_MATCHER = "Edit|Write|MultiEdit|NotebookEdit"
+DISPATCH_CMD = '"$CLAUDE_PROJECT_DIR"/.claude/hooks/ncl/dispatch'
+PAYLOAD_PATH_KEYS = ("file_path", "notebook_path", "path", "filePath",
+                     "AbsolutePath", "TargetFile")
 
 
 class NclError(Exception):
@@ -186,16 +198,240 @@ def is_recent(record: Dict[str, Any], now: Optional[dt.datetime] = None) -> bool
 
 # --- ledger storage ---------------------------------------------------------
 
+def repo_root() -> str:
+    result = git(["rev-parse", "--show-toplevel"], check=False)
+    root = result.stdout.strip() if result.returncode == 0 else os.getcwd()
+    return root.replace("\\", "/")
+
+
+def cache_files() -> Tuple[str, str]:
+    base = os.path.join(repo_root(), CACHE_DIR)
+    return os.path.join(base, LEDGER_FILE), os.path.join(base, "fetched_at")
+
+
+def write_cache(records: Sequence[Dict[str, Any]]) -> None:
+    ledger_path, stamp_path = cache_files()
+    try:
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w", encoding="utf-8", newline="\n") as handle:
+            for item in records:
+                handle.write(json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n")
+        with open(stamp_path, "w", encoding="utf-8") as handle:
+            handle.write(iso(now_utc()))
+    except OSError:
+        pass
+
+
+def read_cache() -> Tuple[Optional[dt.datetime], List[Dict[str, Any]]]:
+    ledger_path, stamp_path = cache_files()
+    try:
+        with open(stamp_path, encoding="utf-8") as handle:
+            fetched = parse_timestamp(handle.read().strip())
+        with open(ledger_path, encoding="utf-8") as handle:
+            return fetched, parse_ledger(handle.read().splitlines())
+    except (OSError, ValueError, NclError):
+        return None, []
+
+
 def fetch_ledger() -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """Fetch origin/agents/ledger. Returns (commit, records); (None, []) if absent."""
-    git(["fetch", "--quiet", "origin", "+refs/heads/agents/ledger:" + LEDGER_REF],
-        check=False)
+    fetched = git(["fetch", "--quiet", "origin", "+refs/heads/agents/ledger:" + LEDGER_REF],
+                  check=False)
     ref = git(["rev-parse", "--verify", "--quiet", LEDGER_REF], check=False)
     if ref.returncode:
+        if fetched.returncode == 0:
+            write_cache([])
         return None, []
     commit = ref.stdout.strip()
     content = git(["show", "{}:{}".format(LEDGER_REF, LEDGER_FILE)])
-    return commit, parse_ledger(content.stdout.splitlines())
+    records = parse_ledger(content.stdout.splitlines())
+    if fetched.returncode == 0:
+        write_cache(records)
+    return commit, records
+
+
+def ledger_for_check(max_age_seconds: float) -> Tuple[List[Dict[str, Any]], str]:
+    """Records for a hook: the local cache while fresh, else a fetch, else
+    the stale cache. Returns (records, note); note is "" when nothing is off."""
+    fetched, cached = read_cache()
+    if fetched is not None and (now_utc() - fetched).total_seconds() <= max_age_seconds:
+        return cached, ""
+    if git(["remote", "get-url", "origin"], check=False).returncode:
+        return cached, "no origin remote; using the local ledger cache"
+    fetch = git(["fetch", "--quiet", "origin", "+refs/heads/agents/ledger:" + LEDGER_REF],
+                check=False)
+    if fetch.returncode != 0:
+        if fetched is None:
+            return [], "could not fetch the ledger and there is no local cache"
+        return cached, "could not fetch the ledger; using the cache from " + iso(fetched)
+    ref = git(["rev-parse", "--verify", "--quiet", LEDGER_REF], check=False)
+    if ref.returncode:
+        write_cache([])
+        return [], ""
+    content = git(["show", "{}:{}".format(LEDGER_REF, LEDGER_FILE)])
+    records = parse_ledger(content.stdout.splitlines())
+    write_cache(records)
+    return records, ""
+
+
+# --- config -----------------------------------------------------------------
+
+def config_path() -> str:
+    return os.path.join(repo_root(), *CONFIG_FILE.split("/"))
+
+
+def load_config() -> Dict[str, Any]:
+    config = dict(DEFAULT_CONFIG)
+    path = config_path()
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read().strip()
+        try:
+            loaded = json.loads(text) if text else {}
+        except ValueError as error:
+            raise NclError("{} is not valid JSON: {}".format(CONFIG_FILE, error))
+        if isinstance(loaded, dict):
+            config.update(loaded)
+    if config.get("enforce") not in ENFORCE_MODES:
+        raise NclError("{}: enforce must be one of {}".format(
+            CONFIG_FILE, ", ".join(ENFORCE_MODES)))
+    return config
+
+
+def save_config(config: Dict[str, Any]) -> None:
+    path = config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+# --- path coverage ----------------------------------------------------------
+
+def pattern_regex(pattern: str) -> "re.Pattern":
+    """A claim pattern as a regex over normalised repo-relative paths.
+
+    `**` spans directories, `*` and `?` stay inside one path segment, and a
+    pattern without wildcards covers that path and everything under it.
+    """
+    pattern = normalise(pattern)
+    if not any(char in pattern for char in "*?["):
+        return re.compile(r"^" + re.escape(pattern) + r"(/.*)?$")
+    out, index = [], 0
+    while index < len(pattern):
+        char = pattern[index]
+        if pattern.startswith("**/", index):
+            out.append("(?:.*/)?")
+            index += 3
+        elif pattern.startswith("**", index):
+            out.append(".*")
+            index += 2
+        elif char == "*":
+            out.append("[^/]*")
+            index += 1
+        elif char == "?":
+            out.append("[^/]")
+            index += 1
+        elif char == "[":
+            end = pattern.find("]", index + 1)
+            if end < 0:
+                out.append(re.escape(char))
+                index += 1
+            else:
+                out.append("[" + pattern[index + 1:end].replace("\\", "\\\\") + "]")
+                index = end + 1
+        else:
+            out.append(re.escape(char))
+            index += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def path_matches(pattern: str, path: str) -> bool:
+    return pattern_regex(pattern).match(normalise(path)) is not None
+
+
+def covered_by(path: str, patterns: Sequence[str]) -> bool:
+    return any(path_matches(pattern, path) for pattern in patterns)
+
+
+def holders_of(path: str, states: Dict[str, Dict[str, Any]],
+               now: dt.datetime) -> List[Dict[str, Any]]:
+    return [item for item in states.values()
+            if is_active(item, now) and covered_by(path, item.get("paths", []))]
+
+
+def relative_to_root(path: str, root: str) -> Optional[str]:
+    """Repo-relative path, or None when the path lies outside the repo."""
+    path = path.replace("\\", "/").strip()
+    if not path:
+        return None
+    if os.path.isabs(path) or re.match(r"^[A-Za-z]:/", path):
+        fold = str.lower if os.name == "nt" else str
+        root_norm = fold(root.replace("\\", "/").rstrip("/")) + "/"
+        if not fold(path).startswith(root_norm):
+            return None
+        return normalise(path[len(root_norm):])
+    return normalise(path)
+
+
+def payload_paths(text: str) -> List[str]:
+    """File paths named by an agent's tool-call payload. Claude Code, Codex,
+    Gemini CLI, Copilot and Antigravity each hand a hook one JSON object; only
+    the field names differ."""
+    try:
+        data = json.loads(text.lstrip("﻿"))
+    except ValueError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    tool_input = data.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = data.get("toolArgs")
+    if not isinstance(tool_input, dict):
+        call = data.get("toolCall")
+        tool_input = call.get("args") if isinstance(call, dict) else None
+    if not isinstance(tool_input, dict):
+        return []
+    for key in PAYLOAD_PATH_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value:
+            return [value]
+    return []
+
+
+def staged_paths() -> List[str]:
+    result = git(["diff", "--cached", "--name-only", "--diff-filter=ACMR"], check=False)
+    return [normalise(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def hook_output(agent: str, decision: str, reason: str) -> str:
+    """The decision in the dialect AGENT reads. Hooks speak Claude Code's
+    shape; the others are translated here."""
+    out: Dict[str, Any] = {}
+    if agent == "codex" and decision == "ask":
+        out["hookSpecificOutput"] = {"hookEventName": "PreToolUse",
+                                    "permissionDecision": "allow",
+                                    "additionalContext": reason}
+    elif agent in ("claude", "codex"):
+        out["hookSpecificOutput"] = {"hookEventName": "PreToolUse",
+                                    "permissionDecision": decision,
+                                    "permissionDecisionReason": reason}
+    elif agent == "copilot":
+        out["permissionDecision"] = decision
+        out["permissionDecisionReason"] = reason
+    elif agent == "gemini":
+        if decision == "deny":
+            out["decision"] = "deny"
+            out["reason"] = reason
+        else:
+            out["systemMessage"] = reason
+    elif agent == "antigravity":
+        out["decision"] = decision
+        out["allow_tool"] = decision != "deny"
+        out["reason"] = reason
+        if decision == "deny":
+            out["deny_reason"] = reason
+    return json.dumps(out)
 
 
 def conflicts_for(record: Dict[str, Any], states: Dict[str, Dict[str, Any]],
@@ -236,6 +472,8 @@ def append_ledger(record: Dict[str, Any], validate_claim: bool = False) -> None:
         pushed = git(["push", "--quiet", "origin", commit + ":" + LEDGER_BRANCH],
                      check=False)
         if pushed.returncode == 0:
+            git(["update-ref", LEDGER_REF, commit], check=False)
+            write_cache(list(records) + [record])
             return
         if attempt == RETRY_LIMIT:
             raise NclError("could not update ledger after {} attempts: {}".format(
@@ -434,6 +672,191 @@ def cmd_log(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check(args: argparse.Namespace) -> int:
+    """Are these paths covered by an active claim held by this agent?
+
+    Plain: prints what is not, exits 2 when anything is not. With --hook the
+    configured mode applies: warn asks (git: prints and allows), deny denies
+    (git: refuses the commit), off is silent.
+    """
+    config = load_config()
+    root = repo_root()
+    hook = args.hook
+    mode = config["enforce"] if hook else "deny"
+
+    if args.payload:
+        raw = [relative_to_root(path, root) for path in payload_paths(sys.stdin.read())]
+        paths = [path for path in raw if path]
+    elif args.staged:
+        paths = staged_paths()
+    else:
+        raw = [relative_to_root(path, root) for path in args.paths]
+        paths = [path for path in raw if path]
+    exempt = [CONFIG_FILE] + list(config.get("exempt", []))
+    paths = [path for path in paths if not covered_by(path, exempt)]
+
+    problems: List[str] = []
+    note = ""
+    if hook == "git" and current_branch() in ("main", "master"):
+        problems.append("this commit is on {}; never-collide work goes on a task "
+                        "branch and arrives by pull request".format(current_branch()))
+    if paths:
+        agent = agent_name(required=False)
+        if agent == "unknown":
+            problems.append("AGENT_NAME is unset, so no claim can cover {}; set this "
+                            "tool's identity and claim the paths".format(", ".join(paths)))
+        else:
+            records, note = ledger_for_check(float(config.get("cache_seconds", 120)))
+            states = latest_states(records)
+            now = now_utc()
+            mine = [pattern for item in states.values()
+                    if item.get("agent") == agent and is_active(item, now)
+                    for pattern in item.get("paths", [])]
+            for path in paths:
+                if covered_by(path, mine):
+                    continue
+                others = [item for item in holders_of(path, states, now)
+                          if item.get("agent") != agent]
+                if others:
+                    problems.append("{} is held by {}; ask with ncl handoff, then stop".format(
+                        path, ", ".join("{} ({})".format(item["agent"], item["task"])
+                                        for item in others)))
+                else:
+                    problems.append("{} is not claimed by {}; run ncl claim first".format(
+                        path, agent))
+
+    if not hook:
+        for line in problems:
+            print(line)
+        if note:
+            print("note: " + note)
+        return 2 if problems else 0
+    if not problems or mode == "off":
+        return 0
+    reason = "never-collide: " + "; ".join(problems)
+    if note:
+        reason += " (" + note + ")"
+    if hook == "git":
+        print(reason, file=sys.stderr)
+        if mode == "deny":
+            print("never-collide: commit refused (enforce is deny; ncl enforce warn relaxes it)",
+                  file=sys.stderr)
+            return 1
+        return 0
+    print(hook_output(hook, "deny" if mode == "deny" else "ask", reason))
+    return 0
+
+
+def cmd_enforce(args: argparse.Namespace) -> int:
+    config = load_config()
+    if not args.mode:
+        print(config["enforce"])
+        return 0
+    config["enforce"] = args.mode
+    save_config(config)
+    print("Enforcement is now {} ({}).".format(args.mode, CONFIG_FILE))
+    return 0
+
+
+GIT_STUB_LINE = '"$(git rev-parse --show-toplevel)/.claude/hooks/ncl/pre-commit" "$@" || exit 1'
+GIT_STUB = """#!/bin/sh
+# never-collide pre-commit stub (managed by install.sh)
+r="$(git rev-parse --show-toplevel)/.claude/hooks/ncl/pre-commit"
+[ -f "$r" ] || exit 0
+""" + GIT_STUB_LINE + "\n"
+
+
+def install_git_stub(root: str) -> str:
+    hooks_dir = git(["-C", root, "rev-parse", "--git-path", "hooks"], check=False)
+    if hooks_dir.returncode:
+        return "git        not a git repository; the commit check runs from Claude Code only"
+    path = hooks_dir.stdout.strip()
+    if not os.path.isabs(path) and not re.match(r"^[A-Za-z]:", path):
+        path = os.path.join(root, path)
+    os.makedirs(path, exist_ok=True)
+    stub = os.path.join(path, "pre-commit")
+    if not os.path.exists(stub):
+        with open(stub, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(GIT_STUB)
+        make_executable(stub)
+        return "git        pre-commit stub installed"
+    with open(stub, encoding="utf-8") as handle:
+        text = handle.read()
+    if "hooks/ncl/pre-commit" in text:
+        return "git        pre-commit already calls never-collide"
+    lines = text.splitlines()
+    exec_lines = [index for index, line in enumerate(lines) if line.startswith("exec ")]
+    if "never-again" in text and exec_lines:
+        lines.insert(exec_lines[-1], GIT_STUB_LINE)
+        with open(stub, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("\n".join(lines) + "\n")
+        return "git        never-collide added to the never-again pre-commit stub"
+    return ("git        you already have a pre-commit hook; add this line to it:\n"
+            "             " + GIT_STUB_LINE)
+
+
+def make_executable(path: str) -> None:
+    try:
+        mode = os.stat(path).st_mode
+        os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except OSError:
+        pass
+
+
+def register_claude(root: str) -> str:
+    path = os.path.join(root, ".claude", "settings.json")
+    settings: Dict[str, Any] = {}
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read().strip()
+        try:
+            settings = json.loads(text) if text else {}
+        except ValueError as error:
+            return ("settings   .claude/settings.json could not be parsed ({}); add the "
+                    "hook yourself, see README".format(error))
+    changed = []
+    env = settings.setdefault("env", {})
+    if isinstance(env, dict) and not env.get("AGENT_NAME"):
+        env["AGENT_NAME"] = "claude"
+        env.setdefault("AGENT_TOOL", "claude-code")
+        changed.append("AGENT_NAME=claude")
+    groups = settings.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    present = any("hooks/ncl/dispatch" in str(hook.get("command", "")).replace("\\", "/")
+                  for group in groups for hook in (group or {}).get("hooks", []) or [])
+    if not present:
+        groups.append({"matcher": EDIT_MATCHER,
+                       "hooks": [{"type": "command", "timeout": 60, "command": DISPATCH_CMD}]})
+        changed.append("PreToolUse dispatch on " + EDIT_MATCHER)
+    if not changed:
+        return "settings   .claude/settings.json already registers never-collide"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(settings, handle, indent=2)
+        handle.write("\n")
+    return "settings   .claude/settings.json: " + ", ".join(changed)
+
+
+def cmd_install_hooks(_: argparse.Namespace) -> int:
+    """Wire the hooks into this repo. Merged, never replaced; safe to re-run."""
+    root = repo_root()
+    lines = []
+    if not os.path.isfile(config_path()):
+        save_config(dict(DEFAULT_CONFIG))
+        lines.append("config     {} created (enforce: warn)".format(CONFIG_FILE))
+    else:
+        lines.append("config     {} kept (enforce: {})".format(CONFIG_FILE, load_config()["enforce"]))
+    for relative in (".claude/never-collide/ncl", ".claude/hooks/ncl/dispatch",
+                     ".claude/hooks/ncl/pre-commit"):
+        full = os.path.join(root, *relative.split("/"))
+        if os.path.isfile(full):
+            make_executable(full)
+    lines.append(register_claude(root))
+    lines.append(install_git_stub(root))
+    for line in lines:
+        print("  " + line)
+    return 0
+
+
 # --- CLI --------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -480,6 +903,23 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument("--paths", nargs="+", metavar="GLOB", help="paths involved")
     handoff.add_argument("-m", "--message", default="",
                          help="what the other agent needs to know")
+
+    check = commands.add_parser(
+        "check", help="may this agent edit these paths? exit 2 when not",
+        description="Exit 0 when every path is covered by an active claim held by "
+                    "this agent, 2 otherwise. --hook applies the configured mode.")
+    check.add_argument("paths", nargs="*", metavar="PATH")
+    check.add_argument("--staged", action="store_true", help="check the staged files")
+    check.add_argument("--payload", action="store_true",
+                       help="read an agent's tool-call payload from stdin")
+    check.add_argument("--hook", choices=("git",) + HOOK_AGENTS,
+                       help="answer as a hook for this runner")
+
+    enforce = commands.add_parser("enforce", help="show or set warn, deny or off")
+    enforce.add_argument("mode", nargs="?", choices=ENFORCE_MODES)
+
+    commands.add_parser("install-hooks",
+                        help="register the edit hook and the git pre-commit stub")
     return parser
 
 
@@ -489,6 +929,9 @@ COMMANDS = {
     "log": cmd_log,
     "claim": cmd_claim,
     "handoff": cmd_handoff,
+    "check": cmd_check,
+    "enforce": cmd_enforce,
+    "install-hooks": cmd_install_hooks,
 }
 
 

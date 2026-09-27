@@ -9,4 +9,5 @@ before each task. Adjust these examples for the repository:
   configuration, and CI.
 - Shared by contract: `src/types/**`.
 
-Version 0.1.0 documents ownership but does not enforce these boundaries.
+Claims are checked by the hooks. The boundaries themselves are a convention;
+enforce them with `dependency-cruiser` or ESLint `no-restricted-imports`.
