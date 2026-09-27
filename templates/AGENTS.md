@@ -3,7 +3,9 @@
 Several AI coding tools share this repository. Call dibs before you touch a
 file. `ncl` below means `python .claude/never-collide/ncl`.
 
-1. **Identity.** `ncl whoami`. If `AGENT_NAME` is unset, stop and say so.
+1. **Identity.** `ncl whoami`. It answers from `AGENT_NAME` or from this
+   clone's `.ncl/agent`. If it fails, stop and ask the user to run
+   `ncl whoami --set <tool>` once here; never guess an identity.
 2. **Sync.** `ncl status` before planning any edit.
 3. **Claim.** `ncl claim --task <id> --paths <globs> --intent '<one line>'`.
    Refused? `ncl handoff --task <id> --to <holder> -m '<what you need>'`,

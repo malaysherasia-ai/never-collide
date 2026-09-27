@@ -18,7 +18,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 LEDGER_FILE = "ledger.jsonl"
 LEDGER_REF = "refs/remotes/origin/agents/ledger"
 LEDGER_BRANCH = "refs/heads/agents/ledger"
@@ -71,11 +71,24 @@ def current_branch() -> str:
 
 # --- identity and time ------------------------------------------------------
 
+def identity_file() -> str:
+    return os.path.join(repo_root(), CACHE_DIR, "agent")
+
+
 def agent_name(required: bool = True) -> str:
+    """AGENT_NAME from the environment, else the identity file of this
+    clone (.ncl/agent, written by `ncl whoami --set`). One clone per tool
+    makes the file the natural place for it."""
     value = os.environ.get("AGENT_NAME", "").strip()
+    if not value:
+        try:
+            with open(identity_file(), encoding="utf-8") as handle:
+                value = handle.read().strip()
+        except OSError:
+            value = ""
     if not value and required:
-        raise NclError("AGENT_NAME is unset; each tool needs its own identity "
-                       "(for example AGENT_NAME=claude or AGENT_NAME=antigravity)")
+        raise NclError("no identity: set AGENT_NAME (Claude Code: .claude/settings.json env) "
+                       "or run `ncl whoami --set <tool>` once in this clone")
     return value or "unknown"
 
 
@@ -483,12 +496,177 @@ def hook_output(agent: str, decision: str, reason: str) -> str:
         else:
             out["systemMessage"] = reason
     elif agent == "antigravity":
+        # Official shape (antigravity.google/docs/hooks): decision + reason.
         out["decision"] = decision
-        out["allow_tool"] = decision != "deny"
         out["reason"] = reason
-        if decision == "deny":
-            out["deny_reason"] = reason
     return json.dumps(out)
+
+
+# --- other agents -----------------------------------------------------------
+# Where each tool keeps its hook config, its skills and its rules file, and
+# which of its tools edit files. Shapes follow each tool's own documentation
+# (see README, "Other tools"); only Claude Code's entry has been run here.
+
+LAUNCH = "~/.never-collide/launch"
+OTHER_AGENTS: Dict[str, Dict[str, Any]] = {
+    "antigravity": {"config": ".agents/hooks.json", "skills": ".agents/skills",
+                    "rules": "AGENTS.md",
+                    "matcher": "write_to_file|replace_file_content|multi_replace_file_content"},
+    "codex": {"config": ".codex/hooks.json", "skills": ".agents/skills", "rules": "AGENTS.md",
+              "matcher": "Edit|Write|apply_patch"},
+    "gemini": {"config": ".gemini/settings.json", "skills": ".gemini/skills", "rules": "GEMINI.md",
+               "matcher": "write_file|replace|edit"},
+    "copilot": {"config": ".github/hooks/never-collide.json", "skills": ".github/skills",
+                "rules": ".github/copilot-instructions.md", "matcher": None},
+}
+
+
+def launcher_path() -> str:
+    return os.path.join(user_dir(), "launch")
+
+
+def entry_command(agent: str, powershell: bool = False) -> str:
+    """One hook entry: no path of this machine, no quote inside the script.
+    The launcher, outside every repo, finds the repo from the payload."""
+    inner = "test -f {0} && exec bash {0} --agent {1}; exit 0".format(LAUNCH, agent)
+    if powershell:
+        return '& "{}" -c "{}"'.format(bash_path() or "C:/Program Files/Git/bin/bash.exe", inner)
+    bash = "bash"
+    if os.name == "nt":
+        found = bash_path()
+        if found:
+            bash = '"{}"'.format(found.replace("\\", "/"))
+    return '{} -c "{}"'.format(bash, inner)
+
+
+def is_our_entry(entry: Dict[str, Any]) -> bool:
+    return any(".never-collide/launch" in str(entry.get(key, "")).replace("\\", "/")
+               for key in ("command", "bash", "powershell"))
+
+
+def json_file(path: str) -> Dict[str, Any]:
+    if not os.path.isfile(path):
+        return {}
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read().strip()
+    data = json.loads(text) if text else {}
+    if not isinstance(data, dict):
+        raise NclError("{} is not a JSON object".format(path))
+    return data
+
+
+def save_json(path: str, data: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(data, handle, indent=2)
+        handle.write("\n")
+
+
+def merge_group(groups: List[Any], matcher: str, entry: Dict[str, Any]) -> bool:
+    """Put our entry into a Claude-shaped [{matcher, hooks:[...]}] list, once."""
+    for group in groups:
+        for hook in (group or {}).get("hooks", []) or []:
+            if is_our_entry(hook):
+                if hook == entry and group.get("matcher") == matcher:
+                    return False
+                hook.clear()
+                hook.update(entry)
+                group["matcher"] = matcher
+                return True
+    groups.append({"matcher": matcher, "hooks": [entry]})
+    return True
+
+
+def install_launcher(root: str) -> str:
+    import shutil
+    source = os.path.join(root, ".claude", "hooks", "ncl", "launch")
+    if not os.path.isfile(source):
+        return "launcher   .claude/hooks/ncl/launch missing; re-run install.sh"
+    os.makedirs(user_dir(), exist_ok=True)
+    shutil.copy(source, launcher_path())
+    make_executable(launcher_path())
+    return "launcher   {} (what the other tools' entries run)".format(launcher_path().replace("\\", "/"))
+
+
+def register_agent(root: str, agent: str) -> str:
+    import shutil
+    spec = OTHER_AGENTS[agent]
+    path = os.path.join(root, *spec["config"].split("/"))
+    try:
+        data = json_file(path)
+    except ValueError as error:
+        return "{:<10} {} could not be parsed ({}); add the entry yourself, see README".format(
+            agent, spec["config"], error)
+    changed = False
+    command = entry_command(agent)
+    if agent == "antigravity":
+        want = {"PreToolUse": [{"matcher": spec["matcher"], "hooks": [
+            {"type": "command", "command": command, "timeout": 30}]}]}
+        if data.get("never-collide") != want:
+            data["never-collide"] = want
+            changed = True
+    elif agent == "codex":
+        groups = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+        changed = merge_group(groups, spec["matcher"], {
+            "type": "command", "command": command, "timeout": 30, "statusMessage": "never-collide"})
+    elif agent == "gemini":
+        groups = data.setdefault("hooks", {}).setdefault("BeforeTool", [])
+        changed = merge_group(groups, spec["matcher"], {
+            "name": "never-collide", "type": "command", "command": command, "timeout": 30000})
+    elif agent == "copilot":
+        want = {"version": 1, "hooks": {"preToolUse": [{
+            "type": "command", "bash": command, "powershell": entry_command(agent, powershell=True),
+            "timeoutSec": 30}]}}
+        changed = data != want
+        data = want
+    if changed:
+        save_json(path, data)
+
+    skill_source = os.path.join(root, ".claude", "skills", "never-collide", "SKILL.md")
+    skill_target = os.path.join(root, *spec["skills"].split("/"), "never-collide", "SKILL.md")
+    if os.path.isfile(skill_source):
+        os.makedirs(os.path.dirname(skill_target), exist_ok=True)
+        shutil.copy(skill_source, skill_target)
+
+    rules = os.path.join(root, *spec["rules"].split("/"))
+    if spec["rules"] != "AGENTS.md" and not os.path.isfile(rules):
+        os.makedirs(os.path.dirname(rules) or root, exist_ok=True)
+        with open(rules, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("@AGENTS.md\n" if agent == "gemini" else
+                         "Read AGENTS.md at the repository root and follow its coordination "
+                         "protocol before editing any file.\n")
+    return "{:<10} {} in {}, skill in {}/never-collide/".format(
+        agent, "registered" if changed else "already registered", spec["config"], spec["skills"])
+
+
+def unregister_agent(root: str, agent: str) -> Optional[str]:
+    import shutil
+    spec = OTHER_AGENTS[agent]
+    path = os.path.join(root, *spec["config"].split("/"))
+    shutil.rmtree(os.path.join(root, *spec["skills"].split("/"), "never-collide"), ignore_errors=True)
+    if not os.path.isfile(path):
+        return None
+    try:
+        data = json_file(path)
+    except ValueError:
+        return None
+    if agent == "copilot":
+        os.remove(path)
+        return spec["config"]
+    if agent == "antigravity":
+        if "never-collide" not in data:
+            return None
+        del data["never-collide"]
+    else:
+        event = "BeforeTool" if agent == "gemini" else "PreToolUse"
+        groups = data.get("hooks", {}).get(event, [])
+        kept = [group for group in groups
+                if not any(is_our_entry(hook) for hook in (group or {}).get("hooks", []) or [])]
+        if len(kept) == len(groups):
+            return None
+        data["hooks"][event] = kept
+    save_json(path, data)
+    return "never-collide entry in " + spec["config"]
 
 
 def conflicts_for(record: Dict[str, Any], states: Dict[str, Dict[str, Any]],
@@ -581,7 +759,17 @@ def load_held(task: str) -> Dict[str, Any]:
 
 # --- commands ---------------------------------------------------------------
 
-def cmd_whoami(_: argparse.Namespace) -> int:
+def cmd_whoami(args: argparse.Namespace) -> int:
+    if args.set_name:
+        name = args.set_name.strip()
+        if not re.match(r"^[A-Za-z0-9._-]+$", name):
+            raise NclError("an identity is letters, digits, dot, dash or underscore")
+        os.makedirs(os.path.dirname(identity_file()), exist_ok=True)
+        with open(identity_file(), "w", encoding="utf-8") as handle:
+            handle.write(name + "\n")
+        print("This clone is {} ({}). AGENT_NAME in the environment still wins.".format(
+            name, os.path.join(CACHE_DIR, "agent")))
+        return 0
     print(agent_name())
     return 0
 
@@ -900,8 +1088,10 @@ def register_claude(root: str) -> str:
     return "settings   .claude/settings.json: " + ", ".join(changed)
 
 
-def cmd_install_hooks(_: argparse.Namespace) -> int:
-    """Wire the hooks into this repo. Merged, never replaced; safe to re-run."""
+def cmd_install_hooks(args: argparse.Namespace) -> int:
+    """Wire the hooks into this repo. Merged, never replaced; safe to re-run.
+    Other tools named with --agent are remembered in the config, so a re-run
+    or an upgrade keeps them."""
     root = repo_root()
     lines = []
     if not os.path.isfile(config_path()):
@@ -910,12 +1100,24 @@ def cmd_install_hooks(_: argparse.Namespace) -> int:
     else:
         lines.append("config     {} kept (enforce: {})".format(CONFIG_FILE, load_config()["enforce"]))
     for relative in (".claude/never-collide/ncl", ".claude/hooks/ncl/dispatch",
-                     ".claude/hooks/ncl/pre-commit"):
+                     ".claude/hooks/ncl/pre-commit", ".claude/hooks/ncl/launch"):
         full = os.path.join(root, *relative.split("/"))
         if os.path.isfile(full):
             make_executable(full)
     lines.append(register_claude(root))
     lines.append(install_git_stub(root))
+
+    config = load_config()
+    agents = [agent for agent in list(config.get("agents", [])) + list(args.agent)
+              if agent in OTHER_AGENTS]
+    agents = sorted(set(agents), key=agents.index)
+    if agents:
+        lines.append(install_launcher(root))
+        for agent in agents:
+            lines.append(register_agent(root, agent))
+        if config.get("agents") != agents:
+            config["agents"] = agents
+            save_config(config)
     for line in lines:
         print("  " + line)
     return 0
@@ -1323,6 +1525,21 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     never_again = os.path.isfile(os.path.join(root, ".claude", "never-again", "na"))
     check(True if never_again else None,
           "never-again " + ("installed alongside" if never_again else "not installed (optional)"))
+    try:
+        registered_agents = [item for item in load_config().get("agents", []) if item in OTHER_AGENTS]
+    except NclError:
+        registered_agents = []
+    if registered_agents:
+        check(os.path.isfile(launcher_path()), "launcher " + launcher_path().replace("\\", "/"))
+    for agent in registered_agents:
+        spec = OTHER_AGENTS[agent]
+        path = os.path.join(root, *spec["config"].split("/"))
+        present = False
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as handle:
+                present = ".never-collide/launch" in handle.read().replace("\\", "/")
+        check(present, "{} entry in {} (registered from its docs; confirm it fires once)".format(
+            agent, spec["config"]))
 
     for status, text in lines:
         print("{} {}".format(status, text))
@@ -1405,10 +1622,19 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
                 handle.write(cleaned)
             removed.append("CLAUDE.md never-collide block")
 
+    try:
+        for agent in load_config().get("agents", []):
+            if agent in OTHER_AGENTS:
+                gone = unregister_agent(root, agent)
+                if gone:
+                    removed.append(gone)
+    except NclError:
+        pass
+
     for item in removed:
         print("  removed  " + item)
     print("  kept     AGENTS.md, .agents/ (ownership, protocol, config), the agents/ledger "
-          "branch on origin, .gitignore lines")
+          "branch on origin, .gitignore lines, {} (shared by every repo)".format(LAUNCH))
     return 0
 
 
@@ -1427,7 +1653,9 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--task", required=True, help="task or issue id, e.g. WCR-42")
         return sub
 
-    commands.add_parser("whoami", help="print AGENT_NAME or fail if it is unset")
+    whoami = commands.add_parser("whoami", help="print this tool's identity, or fail")
+    whoami.add_argument("--set", dest="set_name", metavar="NAME",
+                        help="record the identity of this clone in .ncl/agent")
     commands.add_parser("status", help="show who holds what right now")
 
     log = commands.add_parser("log", help="print ledger events, oldest first")
@@ -1473,8 +1701,10 @@ def build_parser() -> argparse.ArgumentParser:
     enforce = commands.add_parser("enforce", help="show or set warn, deny or off")
     enforce.add_argument("mode", nargs="?", choices=ENFORCE_MODES)
 
-    commands.add_parser("install-hooks",
-                        help="register the edit hook and the git pre-commit stub")
+    install = commands.add_parser("install-hooks",
+                                  help="register the edit hook and the git pre-commit stub")
+    install.add_argument("--agent", action="append", default=[], choices=tuple(OTHER_AGENTS),
+                         help="also register with this tool (repeatable)")
 
     verify = commands.add_parser(
         "verify-pr", help="CI: every changed path claimed on this branch and done",

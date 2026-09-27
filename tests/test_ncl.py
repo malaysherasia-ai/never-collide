@@ -92,6 +92,7 @@ class RepoFixture(unittest.TestCase):
         env = os.environ.copy()
         env.pop("AGENT_TOOL", None)
         env.pop("AGENT_NAME", None)
+        env["NCL_HOME"] = str(self.root / "home")   # never the real home directory
         if agent:
             env["AGENT_NAME"] = agent
         result = run([sys.executable, str(SCRIPT)] + list(args), self.repo, env, stdin)
@@ -110,7 +111,7 @@ class LedgerIntegrationTests(RepoFixture):
         env.pop("AGENT_NAME", None)
         result = run([sys.executable, str(SCRIPT), "whoami"], self.repo, env)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("AGENT_NAME is unset", result.stderr)
+        self.assertIn("no identity", result.stderr)
 
     def test_status_before_any_claim(self):
         result = self.ncl("claude", "status")
@@ -315,7 +316,7 @@ class CheckTests(RepoFixture):
         antigravity = json.loads(self.ncl("claude", "check", "--hook", "antigravity",
                                           "--payload", stdin=payload).stdout)
         self.assertEqual(antigravity["decision"], "ask")
-        self.assertTrue(antigravity["allow_tool"])
+        self.assertEqual(set(antigravity), {"decision", "reason"})
         codex = json.loads(self.ncl("claude", "check", "--hook", "codex", "--payload",
                                     stdin=payload).stdout)
         self.assertEqual(codex["hookSpecificOutput"]["permissionDecision"], "allow")
@@ -583,7 +584,8 @@ class UpgradeTests(RepoFixture):
         source = self.root / ("source-" + version)
         for relative in ("install.sh", "VERSION", ".claude/never-collide/ncl",
                          ".claude/never-collide/ncl.cmd", ".claude/hooks/ncl/dispatch",
-                         ".claude/hooks/ncl/pre-commit", ".claude/skills/never-collide/SKILL.md",
+                         ".claude/hooks/ncl/pre-commit", ".claude/hooks/ncl/launch",
+                         ".claude/skills/never-collide/SKILL.md",
                          "templates/AGENTS.md", "templates/OWNERSHIP.md", "templates/PROTOCOL.md",
                          "templates/never-collide.yml"):
             target = source / relative
@@ -726,6 +728,116 @@ class DoctorAndUninstallTests(RepoFixture):
         self.ncl("claude", "uninstall", "--yes")
         self.assertEqual((hooks_dir / "pre-commit").read_text(encoding="utf-8"),
                          '#!/bin/sh\n# never-again pre-commit stub\nr="x"\nexec "$r" "$@"\n')
+
+
+class IdentityTests(RepoFixture):
+    def test_identity_file_is_used_when_env_is_unset(self):
+        self.ncl(None, "whoami", expect=1)
+        result = self.ncl(None, "whoami", "--set", "antigravity")
+        self.assertIn("This clone is antigravity", result.stdout)
+        self.assertEqual(self.ncl(None, "whoami").stdout.strip(), "antigravity")
+        self.assertEqual(self.ncl("claude", "whoami").stdout.strip(), "claude")
+        self.ncl(None, "whoami", "--set", "bad name", expect=1)
+        self.ncl(None, "claim", "--task", "T-1", "--paths", "src/**", "--intent", "x")
+        self.assertEqual(self.ledger()[-1]["agent"], "antigravity")
+
+
+class OtherAgentsTests(RepoFixture):
+    def install(self, *flags):
+        env = os.environ.copy()
+        env["NCL_NO_PROMPT"] = "1"
+        env["NCL_HOME"] = str(self.root / "home")
+        result = run(["bash", str(ROOT / "install.sh")] + list(flags) + [str(self.repo)], ROOT, env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout
+
+    def test_antigravity_registration_and_launcher(self):
+        out = self.install("--agent", "antigravity", "--identity", "antigravity")
+        self.assertIn("antigravity registered in .agents/hooks.json", out)
+        self.assertIn("This clone is antigravity", out)
+        hooks = json.loads((self.repo / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+        group = hooks["never-collide"]["PreToolUse"][0]
+        self.assertEqual(group["matcher"], "write_to_file|replace_file_content|multi_replace_file_content")
+        command = group["hooks"][0]["command"]
+        self.assertIn("~/.never-collide/launch --agent antigravity; exit 0", command)
+        self.assertEqual(group["hooks"][0]["timeout"], 30)
+        self.assertTrue((self.repo / ".agents" / "skills" / "never-collide" / "SKILL.md").exists())
+        launcher = self.root / "home" / "launch"
+        self.assertTrue(launcher.exists())
+        config = json.loads((self.repo / ".agents" / "never-collide.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["agents"], ["antigravity"])
+
+        again = self.install()
+        self.assertIn("antigravity already registered", again)
+        hooks_again = json.loads((self.repo / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+        self.assertEqual(hooks_again, hooks)
+
+        payload = json.dumps({"toolCall": {"name": "write_to_file", "args": {
+            "TargetFile": str(self.repo / "src" / "page.tsx"), "CodeContent": "x"}},
+            "workspacePaths": [str(self.repo)]})
+        env = os.environ.copy()
+        env.pop("AGENT_NAME", None)
+        result = run(["bash", str(launcher), "--agent", "antigravity"], self.root, env, stdin=payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)
+        self.assertEqual(decision["decision"], "ask")
+        self.assertIn("src/page.tsx is not claimed by antigravity", decision["reason"])
+        self.assertEqual(set(decision), {"decision", "reason"})
+
+        elsewhere = run(["bash", str(launcher), "--agent", "antigravity"], self.root, env,
+                        stdin=json.dumps({"toolCall": {"name": "write_to_file", "args": {
+                            "TargetFile": str(self.root / "x.txt")}},
+                            "workspacePaths": [str(self.root)]}))
+        self.assertEqual(elsewhere.returncode, 0)
+        self.assertEqual(elsewhere.stdout, "")
+
+        doctor = self.ncl(None, "doctor").stdout
+        self.assertIn("OK   antigravity entry in .agents/hooks.json", doctor)
+        self.assertIn("OK   launcher", doctor)
+
+        removed = self.ncl(None, "uninstall", "--yes").stdout
+        self.assertIn("removed  never-collide entry in .agents/hooks.json", removed)
+        self.assertNotIn("never-collide", (self.repo / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+        self.assertFalse((self.repo / ".agents" / "skills" / "never-collide").exists())
+
+    def test_gemini_codex_and_copilot_shapes(self):
+        (self.repo / ".gemini").mkdir()
+        (self.repo / ".gemini" / "settings.json").write_text(
+            json.dumps({"theme": "dark", "hooks": {"BeforeTool": [{"matcher": "run_shell_command",
+                        "hooks": [{"name": "mine", "type": "command", "command": "echo"}]}]}}),
+            encoding="utf-8")
+        self.install("--agent", "gemini", "--agent", "codex", "--agent", "copilot")
+
+        gemini = json.loads((self.repo / ".gemini" / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(gemini["theme"], "dark")
+        self.assertEqual(len(gemini["hooks"]["BeforeTool"]), 2)
+        ours = gemini["hooks"]["BeforeTool"][1]
+        self.assertEqual(ours["matcher"], "write_file|replace|edit")
+        self.assertEqual(ours["hooks"][0]["timeout"], 30000)
+        self.assertEqual((self.repo / "GEMINI.md").read_text(encoding="utf-8"), "@AGENTS.md\n")
+        self.assertTrue((self.repo / ".gemini" / "skills" / "never-collide" / "SKILL.md").exists())
+
+        codex = json.loads((self.repo / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+        self.assertEqual(codex["hooks"]["PreToolUse"][0]["matcher"], "Edit|Write|apply_patch")
+        self.assertEqual(codex["hooks"]["PreToolUse"][0]["hooks"][0]["statusMessage"], "never-collide")
+
+        copilot = json.loads((self.repo / ".github" / "hooks" / "never-collide.json").read_text(encoding="utf-8"))
+        self.assertEqual(copilot["version"], 1)
+        entry = copilot["hooks"]["preToolUse"][0]
+        self.assertIn("--agent copilot", entry["bash"])
+        self.assertIn("--agent copilot", entry["powershell"])
+        self.assertEqual(entry["timeoutSec"], 30)
+        self.assertIn("AGENTS.md", (self.repo / ".github" / "copilot-instructions.md").read_text(encoding="utf-8"))
+
+        config = json.loads((self.repo / ".agents" / "never-collide.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["agents"], ["gemini", "codex", "copilot"])
+
+        self.ncl(None, "uninstall", "--yes")
+        gemini_after = json.loads((self.repo / ".gemini" / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(gemini_after["hooks"]["BeforeTool"]), 1)
+        self.assertFalse((self.repo / ".github" / "hooks" / "never-collide.json").exists())
+        codex_after = json.loads((self.repo / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+        self.assertEqual(codex_after["hooks"]["PreToolUse"], [])
 
 
 if __name__ == "__main__":

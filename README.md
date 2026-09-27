@@ -35,16 +35,53 @@ registers the edit hook in `.claude/settings.json` (merged, never replaced)
 and installs the git pre-commit stub. Safe to re-run; that is also how you
 upgrade.
 
-Then give each tool its own identity. Claude Code reads
-`.claude/settings.json`; the others take an environment variable:
+**One clone per tool.** Two tools in one folder share one checkout and one
+branch, so neither can work on its own branch and each sees the other's
+half-finished edits. Clone the repo once per tool, open each clone in its
+tool, and let the ledger on `origin` do the coordinating.
+
+Then give each clone its identity. Claude Code's comes from
+`.claude/settings.json`, which the installer writes:
 
 ```json
 { "env": { "AGENT_NAME": "claude", "AGENT_TOOL": "claude-code" } }
 ```
 
+In the clone another tool works in, once:
+
 ```sh
-export AGENT_NAME=antigravity
+python .claude/never-collide/ncl whoami --set antigravity
 ```
+
+That writes `.ncl/agent` (local, ignored). `AGENT_NAME` in the environment
+still wins when set.
+
+### Other tools
+
+Antigravity, Codex, Gemini CLI and Copilot read `AGENTS.md` natively, so
+they get the ritual, and the git commit hook and the PR check cover their
+work whatever tool made it. To also register the edit hook with them:
+
+```sh
+bash never-collide/install.sh --agent antigravity .      # repeatable: --agent codex ...
+```
+
+| Tool | Config written | Matcher | Rules and skill |
+|---|---|---|---|
+| Antigravity | `.agents/hooks.json` | `write_to_file\|replace_file_content\|multi_replace_file_content` | `AGENTS.md`, `.agents/skills/` |
+| Codex | `.codex/hooks.json` | `Edit\|Write\|apply_patch` | `AGENTS.md`, `.agents/skills/` |
+| Gemini CLI | `.gemini/settings.json` (`BeforeTool`) | `write_file\|replace\|edit` | `GEMINI.md` (`@AGENTS.md`), `.gemini/skills/` |
+| Copilot | `.github/hooks/never-collide.json` | all | `.github/copilot-instructions.md`, `.github/skills/` |
+
+Each entry runs `~/.never-collide/launch`, which the installer puts outside
+every repo; the entry carries no path of your machine, so the committed
+config works on every clone, and a clone without never-collide installed
+exits quietly. The dispatcher reads each tool's payload and answers in its
+documented shape. These entries follow each tool's own documentation and
+were **not run here**; the first time a tool asks about an unclaimed file
+is the confirmation. `ncl doctor` shows what is registered. Known from
+field reports: Antigravity's hooks have been unreliable on Windows in some
+versions.
 
 ## The ritual
 
@@ -111,8 +148,11 @@ covered by an active claim it holds?
   over the staged files, from any tool or terminal. A commit on `main` is
   flagged too. If never-again is installed, the two share the stub.
 
-Every hook starts in **warn** mode: it asks, it does not stop. When the team
-has run a week without false positives, promote it:
+Every hook starts in **warn** mode: it asks, it does not stop. One
+exception, from Claude Code's own rules: in its auto permission mode an
+`ask` counts as `deny`, so there warn mode already stops an unclaimed edit
+and the agent claims and retries. When the team has run a week without
+false positives, promote it:
 
 ```sh
 ncl enforce deny     # unclaimed edits and commits are refused

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.6.0 - 2026-09-27
+
+Other tools, and identity without environment variables. Built after
+checking the official hook documentation of Claude Code and Antigravity
+(plus Codex, Gemini CLI and Copilot).
+
+- `ncl whoami --set <tool>` records this clone's identity in `.ncl/agent`;
+  `AGENT_NAME` in the environment still wins. `install.sh --identity <tool>`
+  does the same at install time. One clone per tool is the documented setup.
+- `install.sh --agent antigravity|codex|gemini|copilot` (repeatable) and
+  `ncl install-hooks --agent`: registers the edit hook in each tool's own
+  config (`.agents/hooks.json`, `.codex/hooks.json`,
+  `.gemini/settings.json`, `.github/hooks/never-collide.json`) through a
+  launcher at `~/.never-collide/launch`, copies the skill to each tool's
+  skills folder, and creates `GEMINI.md` / `copilot-instructions.md` when
+  missing. Remembered in `.agents/never-collide.json` so re-runs and
+  upgrades keep them. Not run against those tools here.
+- Antigravity output corrected to its documented shape: `decision` and
+  `reason` only. The dispatcher always exits 0 as a hook, takes its
+  identity from `--agent` when `AGENT_NAME` is unset, and finds the repo
+  from its own location before falling back to the payload.
+- `ncl doctor` lists registered tools and the launcher; `ncl uninstall`
+  removes those registrations.
+- README: in Claude Code's auto permission mode an `ask` counts as `deny`
+  (from its docs), so warn mode already stops unclaimed edits there.
+
 ## 0.5.0 - 2026-09-27
 
 A log inside the tool, and the commands a non-developer needs when

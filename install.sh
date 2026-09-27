@@ -1,15 +1,36 @@
 #!/usr/bin/env bash
 # never-collide installer. Safe to run repeatedly.
 #
-#   bash install.sh [target-repo]     install or upgrade; default is the current directory
+#   bash install.sh [target-repo]                 install or upgrade; default is the current directory
+#   bash install.sh --agent antigravity [target]  also register the edit hook with another tool:
+#                                                 antigravity, codex, gemini or copilot (repeatable)
+#   bash install.sh --identity antigravity [target]
+#                                                 record which tool this clone belongs to (.ncl/agent),
+#                                                 for tools that cannot set AGENT_NAME themselves
 #
-# Copies the ncl CLI, the hook dispatcher, the git runner and the Claude Code
-# skill into the target, adds starter AGENTS.md / .agents files only when they
-# are missing, adds a marked block to CLAUDE.md, ignores local state, then
-# registers the edit hook and the git pre-commit stub.
+# Copies the ncl CLI, the hook dispatcher, the git runner, the launcher and
+# the Claude Code skill into the target, adds starter AGENTS.md / .agents
+# files only when they are missing, adds a marked block to CLAUDE.md, ignores
+# local state, then registers the edit hook and the git pre-commit stub.
 set -eu
 
 source_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+agents=()
+identity=""
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --agent) agents+=("--agent" "${2:-}"); shift ;;
+        --agent=*) agents+=("--agent" "${1#--agent=}") ;;
+        --identity) identity=${2:-}; shift ;;
+        --identity=*) identity=${1#--identity=} ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+set -- ${args+"${args[@]}"}
+
 target_dir=${1:-.}
 mkdir -p "$target_dir"
 target_dir=$(CDPATH= cd -- "$target_dir" && pwd)
@@ -40,11 +61,12 @@ copy_file .claude/never-collide/ncl
 copy_file .claude/never-collide/ncl.cmd
 copy_file .claude/hooks/ncl/dispatch
 copy_file .claude/hooks/ncl/pre-commit
+copy_file .claude/hooks/ncl/launch
 copy_file .claude/skills/never-collide/SKILL.md
 chmod +x "$target_dir/.claude/never-collide/ncl" "$target_dir/.claude/hooks/ncl/dispatch" \
-         "$target_dir/.claude/hooks/ncl/pre-commit"
+         "$target_dir/.claude/hooks/ncl/pre-commit" "$target_dir/.claude/hooks/ncl/launch"
 echo "  cli        .claude/never-collide/ncl  (ncl.cmd for PowerShell and cmd)"
-echo "  hooks      .claude/hooks/ncl/dispatch, pre-commit"
+echo "  hooks      .claude/hooks/ncl/dispatch, pre-commit, launch"
 echo "  skill      .claude/skills/never-collide/"
 
 for template in AGENTS.md OWNERSHIP.md PROTOCOL.md; do
@@ -90,18 +112,28 @@ if ! grep -qxF '.claude/never-collide/ncl.log' "$ignore_file"; then
     echo "  gitignore  .claude/never-collide/ncl.log ignored (the local log)"
 fi
 
-(cd "$target_dir" && "$py" .claude/never-collide/ncl install-hooks)
+(cd "$target_dir" && "$py" .claude/never-collide/ncl install-hooks ${agents+"${agents[@]}"})
+
+if [ -n "$identity" ]; then
+    (cd "$target_dir" && "$py" .claude/never-collide/ncl whoami --set "$identity" | sed 's/^/  /')
+fi
 
 cat <<'EOF'
 
-Done. Give each tool its own AGENT_NAME (Claude Code: .claude/settings.json,
-already set to "claude"; others: an environment variable), then:
+Done. One clone per tool. Claude Code's identity is in .claude/settings.json
+(AGENT_NAME=claude). In the clone another tool works in, run once:
+
+  python .claude/never-collide/ncl whoami --set antigravity
+
+Then, in every clone:
 
   python .claude/never-collide/ncl whoami
   python .claude/never-collide/ncl status
+  python .claude/never-collide/ncl doctor
 
 Edits and commits outside an active claim are asked about (enforce: warn).
 When the team is ready: python .claude/never-collide/ncl enforce deny
+Other tools' edit hooks: bash install.sh --agent antigravity|codex|gemini|copilot .
 Upgrade later:          python .claude/never-collide/ncl upgrade
 EOF
 
