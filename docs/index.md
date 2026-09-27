@@ -42,6 +42,28 @@ Two minutes. bash, Python 3.7+ and git. No Node, no service, no telemetry.
 If never-again is already installed, it is the same command and the two
 share the git hook.
 
+## Set up two tools, step by step
+
+One clone per tool. The folder Antigravity already works in is its clone;
+make a second clone for Claude Code and open it in VS Code.
+
+1. In the Claude Code clone, on a branch:
+   `bash never-collide/install.sh --agent antigravity .` then commit, pull
+   request, merge. That commit carries the tool, the hooks, `AGENTS.md`,
+   `.agents/` (Antigravity's hook config included) and Claude Code's
+   identity.
+2. In the Antigravity folder: `git pull`, then
+   `python .claude/never-collide/ncl install-hooks` (git hooks are never
+   committed) and `python .claude/never-collide/ncl whoami --set antigravity`
+   (this clone's identity).
+3. `python .claude/never-collide/ncl doctor` in both. Every line OK.
+4. Fill in `.agents/OWNERSHIP.md`: who owns which paths.
+5. Run a week in warn mode. `ncl status` shows what the other tool holds;
+   `ncl report` shows what the hooks decided. Then `ncl enforce deny`.
+
+The full version, with every command, is the "Setting up two tools" section
+of the README.
+
 ## For you
 
 You run Claude Code for the logic and Antigravity for the UI on the same
