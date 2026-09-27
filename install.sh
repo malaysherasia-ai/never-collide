@@ -120,21 +120,24 @@ fi
 
 cat <<'EOF'
 
-Done. One clone per tool. Claude Code's identity is in .claude/settings.json
-(AGENT_NAME=claude). In the clone another tool works in, run once:
+Done. What to do next, in order:
 
-  python .claude/never-collide/ncl whoami --set antigravity
+  1. Commit what this added, on a branch, and merge it by pull request. It
+     carries the tool, the hooks, AGENTS.md, .agents/ and Claude Code's
+     identity (AGENT_NAME=claude in .claude/settings.json).
+  2. One clone per tool. In the clone another tool works in, after pulling:
+       python .claude/never-collide/ncl install-hooks
+       python .claude/never-collide/ncl whoami --set antigravity   (or codex, gemini, copilot)
+     Its edit hook needs a registration in the committed config; if you did
+     not pass --agent to this installer, run it again with
+       bash install.sh --agent antigravity .
+  3. In every clone:  python .claude/never-collide/ncl doctor
+  4. Write down who owns what in .agents/OWNERSHIP.md.
+  5. Run a week in warn mode (edits and commits outside a claim are asked
+     about, never stopped). Then:  python .claude/never-collide/ncl enforce deny
 
-Then, in every clone:
-
-  python .claude/never-collide/ncl whoami
-  python .claude/never-collide/ncl status
-  python .claude/never-collide/ncl doctor
-
-Edits and commits outside an active claim are asked about (enforce: warn).
-When the team is ready: python .claude/never-collide/ncl enforce deny
-Other tools' edit hooks: bash install.sh --agent antigravity|codex|gemini|copilot .
-Upgrade later:          python .claude/never-collide/ncl upgrade
+Later:  ncl status (who holds what)  ncl report (what the hooks decided)
+        ncl upgrade                    ncl feedback
 EOF
 
 # One question, once per machine, Enter skips it. Never in CI (no TTY) and

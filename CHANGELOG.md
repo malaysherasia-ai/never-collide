@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.2 - 2026-09-27
+
+- One walkthrough for setting up two tools on one repo, in the README, in
+  the site docs and in what the installer prints when it finishes: second
+  clone, install with `--agent`, pull request, `install-hooks` and
+  `whoami --set` in the other clone, `doctor` in both, ownership, a week in
+  warn mode. Nothing else changes.
+
 ## 0.6.1 - 2026-09-27
 
 - `ncl upgrade` falls back to the full releases list when GitHub's

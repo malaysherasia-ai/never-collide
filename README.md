@@ -98,6 +98,62 @@ is the confirmation. `ncl doctor` shows what is registered. Known from
 field reports: Antigravity's hooks have been unreliable on Windows in some
 versions.
 
+## Setting up two tools on one repo, step by step
+
+The worked case: a site built in Antigravity, and Claude Code joining it.
+Swap the names for any pair. `ncl` below means
+`python .claude/never-collide/ncl`.
+
+1. **Make the second clone.** The folder Antigravity already works in is
+   the Antigravity clone. Clone the repo once more, anywhere, for Claude
+   Code, and open that folder in VS Code:
+
+   ```sh
+   git clone https://github.com/<you>/<repo>.git <repo>-claude
+   ```
+
+2. **Install from the Claude Code clone**, naming the other tool so its
+   hook config is written and committed with the repo:
+
+   ```sh
+   cd <repo>-claude
+   git checkout -b setup/never-collide
+   git clone --depth 1 https://github.com/malaysherasia-ai/never-collide.git
+   bash never-collide/install.sh --agent antigravity .
+   rm -rf never-collide
+   ```
+
+   Commit the branch, open a pull request, merge it. That commit carries
+   `ncl`, the hooks, the skill, `AGENTS.md`, `.agents/`, the PR workflow and
+   Claude Code's identity in `.claude/settings.json`.
+
+3. **Wire the Antigravity clone.** Git hooks are never committed, and each
+   clone needs its own identity, so in the Antigravity folder:
+
+   ```sh
+   git pull
+   python .claude/never-collide/ncl install-hooks
+   python .claude/never-collide/ncl whoami --set antigravity
+   ```
+
+4. **Check both clones** with `ncl doctor`. Every line should read OK. In
+   the Antigravity clone the last line names its hook entry and asks you to
+   confirm it fires once: the first time Antigravity is asked about an
+   unclaimed file is that confirmation.
+
+5. **Write down who owns what** in `.agents/OWNERSHIP.md`. The installer
+   left a starter; `examples/wecarerehab/OWNERSHIP.md` is a finished one
+   (UI paths to Antigravity, logic paths to Claude Code, `src/types` shared
+   by contract).
+
+6. **Run a week in warn mode.** Give each tool a task. `ncl status` in
+   either clone shows what the other holds; `ncl report` shows what the
+   hooks decided. When nothing was asked about wrongly, `ncl enforce deny`
+   in one clone, commit it, and both clones stop unclaimed edits.
+
+Something off? `ncl doctor` says what to fix; paste it and `ncl report` into
+an issue, or `ncl feedback -m '...' --report`.
+
 ## The ritual
 
 `ncl` below means `python .claude/never-collide/ncl` (or add an alias).

@@ -18,7 +18,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 LEDGER_FILE = "ledger.jsonl"
 LEDGER_REF = "refs/remotes/origin/agents/ledger"
 LEDGER_BRANCH = "refs/heads/agents/ledger"
