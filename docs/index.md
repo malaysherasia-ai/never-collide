@@ -5,6 +5,32 @@
 Content for `claude-repo.com/never-collide`. Sections follow the hub nav:
 Install · For you · Numbers · Why · Compare · FAQ · Docs · GitHub.
 
+## Page metadata
+
+For the Next.js route's `metadata` export. Title under 60 characters,
+description under 160, one canonical URL, one Open Graph image.
+
+- **Title:** `never-collide: parallel AI coding on one repo, no collisions`
+- **Description:** `Claude Code, Antigravity, Codex, Gemini CLI and Copilot
+  on one Git repo without breaking each other's work. Agents claim files
+  before editing. bash, Python, git. MIT.`
+- **Canonical:** `https://www.claude-repo.com/never-collide`
+- **Open Graph:** same title and description; image
+  `/never-collide/og.png` (1200x630, tagline on the hub's background)
+- **Search terms the page should answer:** multi-agent coding same repo;
+  Claude Code and Antigravity together; AI agents overwriting each other's
+  code; agent file locking git; AGENTS.md coordination; Codex Gemini CLI
+  Copilot shared repository; parallel AI development without merge
+  conflicts. Use them in headings and body where they read naturally; the
+  headings below already carry most of them.
+- **Structured data:** `SoftwareApplication` JSON-LD with name, description,
+  `applicationCategory: DeveloperApplication`, `operatingSystem: Windows,
+  macOS, Linux`, `offers.price: 0`, `license: MIT`, `codeRepository` set to
+  the GitHub URL.
+- **Raw files for tools:** `/never-collide/AGENTS.md` and
+  `/never-collide/PROTOCOL.md`, served as `text/markdown`, linked from the
+  Docs section and listed in `llms.txt`.
+
 ## Install
 
 ```sh
