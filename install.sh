@@ -58,6 +58,13 @@ for template in AGENTS.md OWNERSHIP.md PROTOCOL.md; do
     fi
 done
 
+workflow="$target_dir/.github/workflows/never-collide.yml"
+if [ ! -e "$workflow" ]; then
+    mkdir -p "$target_dir/.github/workflows"
+    cp "$source_root/templates/never-collide.yml" "$workflow"
+    echo "  created    .github/workflows/never-collide.yml (PR check)"
+fi
+
 claude_file="$target_dir/CLAUDE.md"
 if [ ! -e "$claude_file" ]; then
     printf '@AGENTS.md\n' > "$claude_file"

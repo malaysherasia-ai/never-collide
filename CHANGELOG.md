@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 - 2026-09-27
+
+The pull-request check, the docs page and the adopter example.
+
+- `ncl verify-pr --base --head --branch [--require done|tested]`: every path
+  changed by the PR must be covered by a claim recorded on its branch (or
+  whose task id is a segment of the branch name), and that claim must be
+  `done`, or `tested` when required. TTL is ignored: done stays done.
+- `.github/workflows/never-collide.yml`, installed when absent, runs it on
+  every pull request.
+- `docs/index.md`: the content for `claude-repo.com/never-collide`.
+- `examples/wecarerehab/`: the first adopter's ownership map and Claude Code
+  settings, anonymised.
+
 ## 0.2.0 - 2026-09-27
 
 Enforcement: hooks that check claims before an edit and before a commit.

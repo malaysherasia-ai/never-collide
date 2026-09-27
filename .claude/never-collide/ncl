@@ -18,7 +18,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 LEDGER_FILE = "ledger.jsonl"
 LEDGER_REF = "refs/remotes/origin/agents/ledger"
 LEDGER_BRANCH = "refs/heads/agents/ledger"
@@ -31,6 +31,7 @@ CONFIG_FILE = ".agents/never-collide.json"
 DEFAULT_CONFIG = {"enforce": "warn", "exempt": [], "cache_seconds": 120}
 ENFORCE_MODES = ("warn", "deny", "off")
 CACHE_DIR = ".ncl"
+BUILTIN_EXEMPT = [CONFIG_FILE, CACHE_DIR + "/**"]
 HOOK_AGENTS = ("claude", "codex", "gemini", "copilot", "antigravity")
 EDIT_MATCHER = "Edit|Write|MultiEdit|NotebookEdit"
 DISPATCH_CMD = '"$CLAUDE_PROJECT_DIR"/.claude/hooks/ncl/dispatch'
@@ -692,7 +693,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     else:
         raw = [relative_to_root(path, root) for path in args.paths]
         paths = [path for path in raw if path]
-    exempt = [CONFIG_FILE] + list(config.get("exempt", []))
+    exempt = BUILTIN_EXEMPT + list(config.get("exempt", []))
     paths = [path for path in paths if not covered_by(path, exempt)]
 
     problems: List[str] = []
@@ -857,6 +858,75 @@ def cmd_install_hooks(_: argparse.Namespace) -> int:
     return 0
 
 
+REQUIRED_STATUSES = {"done": ("done", "tested", "released"),
+                     "tested": ("tested", "released")}
+
+
+def branch_tasks(branch: str, records: Sequence[Dict[str, Any]]) -> List[str]:
+    """Tasks recorded on BRANCH, or named by one of its path segments."""
+    tasks: List[str] = []
+    segments = set(branch.split("/"))
+    for record in records:
+        task = record.get("task")
+        if task and task not in tasks and (record.get("branch") == branch or task in segments):
+            tasks.append(task)
+    return tasks
+
+
+def cmd_verify_pr(args: argparse.Namespace) -> int:
+    """Does the ledger cover a pull request? For CI.
+
+    Every path changed between base and head must be covered by a claim on
+    the PR's branch, and each such claim must have reached --require (done,
+    or tested). TTL is ignored here: a claim that is done stays done.
+    """
+    config = load_config()
+    diff = git(["diff", "--name-only", "{}...{}".format(args.base, args.head)], check=False)
+    if diff.returncode:
+        raise NclError("could not diff {}...{}: {}".format(
+            args.base, args.head, diff.stderr.strip()))
+    exempt = BUILTIN_EXEMPT + list(config.get("exempt", []))
+    changed = [normalise(line) for line in diff.stdout.splitlines() if line.strip()]
+    changed = [path for path in changed if not covered_by(path, exempt)]
+
+    require_origin()
+    commit, records = fetch_ledger()
+    if commit is None:
+        print("never-collide: origin has no agents/ledger branch yet")
+        return 1
+    states = latest_states(records)
+    tasks = branch_tasks(args.branch, records)
+    failures: List[str] = []
+    if not tasks:
+        failures.append("no claim on branch {} (a claim records the branch it was "
+                        "made on, or the task id is a segment of the branch name)".format(
+                            args.branch))
+    patterns: List[str] = []
+    for task in tasks:
+        state = states.get(task, {})
+        status = state.get("status", "?")
+        print("{:<12} {:<12} {:<10} {}".format(
+            state.get("agent", "?"), status, task, ", ".join(state.get("paths", [])) or "-"))
+        if status not in REQUIRED_STATUSES[args.require]:
+            failures.append("{} is {}, needs {} (ncl {})".format(
+                task, status, " or ".join(REQUIRED_STATUSES[args.require]), args.require))
+        patterns.extend(state.get("paths", []))
+    for path in changed:
+        if not covered_by(path, patterns):
+            holders = holders_of(path, states, now_utc())
+            who = ", ".join("{} ({})".format(item["agent"], item["task"]) for item in holders)
+            failures.append("{} changed without a claim on this branch{}".format(
+                path, " (held by " + who + ")" if who else ""))
+    print()
+    if failures:
+        for line in failures:
+            print("FAIL " + line)
+        return 1
+    print("OK   {} changed path(s) covered by {} claim(s) at {}".format(
+        len(changed), len(tasks), args.require))
+    return 0
+
+
 # --- CLI --------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -920,6 +990,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("install-hooks",
                         help="register the edit hook and the git pre-commit stub")
+
+    verify = commands.add_parser(
+        "verify-pr", help="CI: every changed path claimed on this branch and done",
+        description="Exit 1 unless every path changed between base and head is covered "
+                    "by a claim on the branch and that claim has reached --require.")
+    verify.add_argument("--base", required=True, help="base ref, e.g. origin/main")
+    verify.add_argument("--head", required=True, help="head ref or sha")
+    verify.add_argument("--branch", required=True, help="the PR's head branch name")
+    verify.add_argument("--require", choices=tuple(REQUIRED_STATUSES), default="done")
     return parser
 
 
@@ -932,6 +1011,7 @@ COMMANDS = {
     "check": cmd_check,
     "enforce": cmd_enforce,
     "install-hooks": cmd_install_hooks,
+    "verify-pr": cmd_verify_pr,
 }
 
 

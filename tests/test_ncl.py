@@ -435,5 +435,60 @@ class EndToEndCommitTests(RepoFixture):
         self.assertIn("README.md is not claimed", decision["permissionDecisionReason"])
 
 
+class VerifyPrTests(RepoFixture):
+    def setUp(self):
+        super().setUp()
+        (self.repo / "README.md").write_text("base\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "base")
+        self.git("push", "-q", "-u", "origin", "main")
+        self.git("checkout", "-q", "-b", "claude/T-1")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "a.ts").write_text("export {}\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "work")
+
+    def verify(self, *extra, expect):
+        return self.ncl("ci", "verify-pr", "--base", "origin/main", "--head", "HEAD",
+                        "--branch", "claude/T-1", *extra, expect=expect)
+
+    def test_no_ledger_and_no_claim_fail(self):
+        self.assertIn("no agents/ledger branch", self.verify(expect=1).stdout)
+        self.ncl("claude", "claim", "--task", "T-9", "--paths", "src/**", "--intent", "x")
+        self.git("checkout", "-q", "-b", "claude/other")
+        result = self.ncl("ci", "verify-pr", "--base", "origin/main", "--head", "HEAD",
+                          "--branch", "claude/other", expect=1)
+        self.assertIn("no claim on branch claude/other", result.stdout)
+
+    def test_claim_must_be_done_and_cover_every_path(self):
+        self.ncl("claude", "claim", "--task", "T-1", "--paths", "src/**", "--intent", "x")
+        result = self.verify(expect=1)
+        self.assertIn("T-1 is claimed, needs done", result.stdout)
+
+        self.ncl("claude", "done", "--task", "T-1", "--pr", "1")
+        self.assertIn("OK   1 changed path(s) covered by 1 claim(s)", self.verify(expect=0).stdout)
+        self.assertIn("T-1 is done, needs tested", self.verify("--require", "tested", expect=1).stdout)
+
+        (self.repo / "docs.md").write_text("x\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "more")
+        result = self.verify(expect=1)
+        self.assertIn("docs.md changed without a claim on this branch", result.stdout)
+
+        self.ncl("claude", "tested", "--task", "T-1", "--evidence", "ran")
+        self.ncl("claude", "release", "--task", "T-1")
+        (self.repo / "docs.md").unlink()
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "undo")
+        self.verify("--require", "tested", expect=0)
+
+    def test_task_named_in_branch_counts_even_if_claimed_elsewhere(self):
+        self.git("checkout", "-q", "main")
+        self.ncl("claude", "claim", "--task", "T-1", "--paths", "src/**", "--intent", "x")
+        self.ncl("claude", "done", "--task", "T-1")
+        self.git("checkout", "-q", "claude/T-1")
+        self.verify(expect=0)
+
+
 if __name__ == "__main__":
     unittest.main()
