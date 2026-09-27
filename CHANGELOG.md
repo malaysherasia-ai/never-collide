@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0 - 2026-09-27
+
+Opt-in usage count and feedback, and `ncl upgrade`.
+
+- `ncl feedback`: `--count` sends version, OS and Python only; `--name`,
+  `--email`, `--tools`, `-m` add what the person typed. Shows the exact
+  payload and sends only on a yes (`--yes` to skip; `--dry-run` to see it
+  and send nothing). Endpoint contract in `docs/feedback-endpoint.md`; the
+  site route is not built yet.
+- The installer asks once per machine, Enter skips, never in CI (no TTY)
+  and never with `NCL_NO_PROMPT=1`. The marker lives in `~/.never-collide/`
+  (`NCL_HOME` overrides).
+- `ncl upgrade [--check] [--yes] [--from DIR]`: GitHub's latest release,
+  or a local clone, installed here through its own `install.sh`.
+- `ncl version`.
+- Tests: feedback against a local HTTP server, the silent prompt, an
+  unreachable endpoint, upgrade from a local source, no-network upgrade.
+
 ## 0.3.0 - 2026-09-27
 
 The pull-request check, the docs page and the adopter example.

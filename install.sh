@@ -98,4 +98,9 @@ already set to "claude"; others: an environment variable), then:
 
 Edits and commits outside an active claim are asked about (enforce: warn).
 When the team is ready: python .claude/never-collide/ncl enforce deny
+Upgrade later:          python .claude/never-collide/ncl upgrade
 EOF
+
+# One question, once per machine, Enter skips it. Never in CI (no TTY) and
+# never when NCL_NO_PROMPT is set.
+(cd "$target_dir" && "$py" .claude/never-collide/ncl feedback --install-prompt) || true
