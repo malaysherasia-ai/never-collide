@@ -2,8 +2,16 @@
 
 `ncl feedback` and the installer's one-time prompt POST to
 `https://www.claude-repo.com/api/never-collide/feedback` (override with
-`NCL_FEEDBACK_URL`). The endpoint does not exist yet; this is what the site
-must implement so the counts and messages land somewhere.
+`NCL_FEEDBACK_URL`).
+
+**Status (2026-09-27):** built and deployed, as `api/never-collide/feedback.js`
+in the claude-repo.com site repo. Store: one GitHub issue per message in the
+private repo `malaysherasia-ai/never-collide-feedback`, labelled `count` or
+`feedback`. Until the site's `FEEDBACK_TOKEN` environment variable is set on
+Vercel (a fine-grained token with Issues read/write on that repo), the
+endpoint answers `503 {"error": "feedback store not configured"}` and `ncl`
+shows that line to the person. `scripts/feedback-check.mjs` in the site repo
+exercises every branch below against a stub GitHub.
 
 ## Request
 
@@ -31,21 +39,26 @@ no paths, no ledger content.
 the first 200 bytes. Any non-2xx or a timeout is reported to the person as
 "could not send feedback"; nothing is retried.
 
-## Site side (Next.js route on Vercel)
+## Site side (Vercel serverless function, as built)
 
-- Route: `app/api/never-collide/feedback/route.ts`, `POST` only.
-- Validate: `project === "never-collide"`, `event` in the two values,
-  each string at most 2000 characters, body at most 16 KB. Reject anything
-  else with `400`.
-- Store: a table with the raw JSON, the `event`, the received time and
-  nothing derived from the request beyond that. Vercel Postgres or KV both
-  fit. For `feedback` events with an `email`, also forward the message by
-  email (Resend) so a reply can happen.
-- Rate limit by IP (a handful per minute) and do not log IPs beyond that.
-- Numbers for the site's Numbers section: `count` plus `feedback` events
-  grouped by version and OS, alongside the GitHub clone counter that needs
-  no client at all.
-- No auth, no CORS (the client is `ncl`, not a browser).
+- Function: `api/never-collide/feedback.js` in the site repo, `POST` only
+  (`405` otherwise). The site is static HTML plus Vercel functions; there
+  is no framework and no database.
+- Validate: `project === "never-collide"`, `event` in the two values, every
+  string at most 2000 characters, body at most 16 KB (`413`). Anything else
+  is `400` with a one-line reason. A `count` event drops the personal
+  fields even if sent.
+- Store: one issue per message in the private GitHub repo, title
+  `[event] name: first words · version · os`, body the cleaned JSON in a
+  fenced block, label `count` or `feedback`. Replies to an `email` happen
+  from the issue by hand; no mail service is involved.
+- Rate limit: six messages per minute per address, instance-local, `429`
+  beyond that. The address is written into the issue body and nowhere else.
+- Numbers for the site's Numbers section: search the private repo for
+  `label:count` and `label:feedback`, grouped by version and OS from the
+  titles, alongside the GitHub clone counter that needs no client at all.
+- No auth, no CORS (the client is `ncl`, not a browser). `FEEDBACK_REPO`
+  and `FEEDBACK_API` override the repo and the API base for tests.
 
 ## Privacy line for the docs
 
