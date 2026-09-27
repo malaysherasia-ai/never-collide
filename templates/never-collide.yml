@@ -1,0 +1,29 @@
+# never-collide pull-request check. Installed as
+# .github/workflows/never-collide.yml. Every path a PR changes must be covered
+# by a claim recorded on the PR's branch, and that claim must be `done` in the
+# ledger (agents/ledger). Change --require to `tested` once every agent
+# records test evidence before asking for a merge.
+name: never-collide
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  claims:
+    name: ledger covers this PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check claims
+        run: >
+          python3 .claude/never-collide/ncl verify-pr
+          --base "origin/${{ github.base_ref }}"
+          --head "${{ github.event.pull_request.head.sha }}"
+          --branch "${{ github.head_ref }}"
+          --require done

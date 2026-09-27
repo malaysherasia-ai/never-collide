@@ -128,8 +128,17 @@ Hooks read a local ledger cache (`.ncl/`, ignored) refreshed at most every two
 minutes, so an edit does not wait on the network; a claim refreshes it at
 once. Offline, the last cache is used and the answer says so.
 
-Not yet: a pull-request check. Until then a PR review is the last line.
-See [CHANGELOG.md](CHANGELOG.md).
+- **Pull-request check (GitHub Actions).** `.github/workflows/never-collide.yml`
+  runs `ncl verify-pr` on every PR: each changed path must be covered by a
+  claim recorded on the PR's branch, and that claim must be `done`. Switch
+  `--require done` to `--require tested` once every agent records evidence
+  before asking for a merge. A claim that has expired by TTL still counts
+  here; done stays done.
+
+Nobody commits to `main`: branch per agent per task, PR, preview, merge.
+Real merge conflicts surface at PR time, where a person sees them.
+
+See [CHANGELOG.md](CHANGELOG.md) for what each version added.
 
 ## Requirements
 
