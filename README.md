@@ -2,15 +2,30 @@
 
 **Parallel coding on one repo, without the collisions.**
 
-Claude Code, Antigravity, Codex, Gemini CLI and Copilot working on the same
-codebase at the same time, without stepping on each other. Every agent calls
-dibs before it touches a file, logs what it did, and logs when it was tested.
-The other agents see it before they start.
+[![tests](https://github.com/malaysherasia-ai/never-collide/actions/workflows/tests.yml/badge.svg)](https://github.com/malaysherasia-ai/never-collide/actions/workflows/tests.yml)
+[![release](https://img.shields.io/github/v/release/malaysherasia-ai/never-collide?label=release)](https://github.com/malaysherasia-ai/never-collide/releases)
+[![python 3.7+](https://img.shields.io/badge/python-3.7%2B-blue)](#requirements)
+[![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+Multi-agent coordination for one shared Git repository. Claude Code,
+Google Antigravity, OpenAI Codex, Gemini CLI and GitHub Copilot working on
+the same codebase at the same time, without stepping on each other. Every
+AI coding agent calls dibs on the files it is about to touch, logs what it
+did and when it was tested, and the other agents see it before they start.
+An edit hook, a git pre-commit hook and a pull-request check make sure of
+it.
 
 Second member of the `never-*` family after
-[never-again](https://github.com/malaysherasia-ai/claude-never-again). Same
-install pattern, same runtime: bash, Python 3.7+ and git. No Node, no npm, no
-service, no telemetry.
+[never-again](https://github.com/malaysherasia-ai/claude-never-again),
+which stops the same bug twice. Same install pattern, same runtime: bash,
+Python 3.7+ and git. No Node, no npm, no service, no telemetry. MIT.
+
+- Site: [claude-repo.com/never-collide](https://www.claude-repo.com/never-collide)
+- Works with: Claude Code (edit hook wired and tested), Antigravity, Codex,
+  Gemini CLI, Copilot (edit hooks registered from their docs), and any tool
+  that can run a shell command and read `AGENTS.md`
+- Problems and ideas: [GitHub Issues](https://github.com/malaysherasia-ai/never-collide/issues)
+  or `ncl feedback`
 
 ## Install
 
